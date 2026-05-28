@@ -42,8 +42,8 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 max_turns=6
-max_prompt_length=$((1024 * 12))
-max_response_length=$((1024 * 4))
+max_prompt_length=$((1024 * 2))
+max_response_length=$((1024 * 1))
 
 loss_mode="gspo"
 loss_agg_mode="seq-mean-token-mean"
@@ -86,10 +86,10 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 train_batch_size=0
 gen_prompt_bsz=1
-n_resp_per_prompt=8
+n_resp_per_prompt=1
 ppo_mini_batch_size=16
-total_rollout_steps=$(((64 * 32 * 10)))
-test_freq=10
+total_rollout_steps=1
+test_freq=-1
 staleness_threshold=0.5
 trigger_parameter_sync_step=4
 require_batches=1
@@ -235,7 +235,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.save_freq=15 \
+    trainer.save_freq=-1 \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
