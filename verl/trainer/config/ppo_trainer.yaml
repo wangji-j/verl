@@ -46,6 +46,12 @@ defaults:
   # self config override anything above
   - _self_
 
+# Router diagnostics.
+router:
+
+  # Whether to compare rollout and training MoE router choices.
+  enable_mismatch_metrics: False
+
 # config for actor, rollout and reference model
 actor_rollout_ref:
 

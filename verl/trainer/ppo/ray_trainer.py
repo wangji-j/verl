@@ -65,6 +65,7 @@ from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
+from verl.utils.router_mismatch_metrics import compute_router_mismatch_metrics
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -329,6 +330,27 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        self.router_mismatch_metrics_enabled = bool(
+            OmegaConf.select(self.config, "router.enable_mismatch_metrics", default=False)
+        )
+        if self.router_mismatch_metrics_enabled:
+            actor_strategy = OmegaConf.select(self.config, "actor_rollout_ref.actor.strategy")
+            rollout_name = OmegaConf.select(self.config, "actor_rollout_ref.rollout.name")
+            if actor_strategy not in {"fsdp", "fsdp2"}:
+                raise ValueError(
+                    "router.enable_mismatch_metrics requires FSDP actor strategy; "
+                    f"got actor_rollout_ref.actor.strategy={actor_strategy!r}"
+                )
+            if rollout_name != "vllm":
+                raise ValueError(
+                    "router.enable_mismatch_metrics requires vLLM rollout; "
+                    f"got actor_rollout_ref.rollout.name={rollout_name!r}"
+                )
+            with open_dict(self.config):
+                if "router" not in self.config.actor_rollout_ref:
+                    self.config.actor_rollout_ref.router = {}
+                self.config.actor_rollout_ref.router.enable_mismatch_metrics = True
+                self.config.actor_rollout_ref.rollout.enable_return_routed_experts = True
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -1280,6 +1302,8 @@ class RayPPOTrainer:
         log_probs = no_padding_2_padding(log_probs, batch_td)
         if sum_pi_squared is not None:
             sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
+        if routed_experts is not None:
+            routed_experts = no_padding_2_padding(routed_experts, batch_td)
         # step 5: rebuild a tensordict and convert to dataproto
         result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
         if routed_experts is not None:
@@ -1289,6 +1313,22 @@ class RayPPOTrainer:
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
+
+    def _maybe_compute_router_mismatch_metrics(self, batch: DataProto, old_log_prob: DataProto) -> dict[str, float]:
+        if not self.router_mismatch_metrics_enabled:
+            return {}
+        if "routed_experts" not in batch.batch:
+            raise RuntimeError("router.enable_mismatch_metrics requires rollout routed_experts from vLLM.")
+        if "routed_experts" not in old_log_prob.batch:
+            raise RuntimeError("router.enable_mismatch_metrics requires FSDP routed_experts from old_log_prob.")
+
+        result = compute_router_mismatch_metrics(
+            batch.batch["routed_experts"],
+            old_log_prob.batch["routed_experts"],
+            batch.batch["response_mask"],
+            metric_prefix="router/rollout_vs_train",
+        )
+        return result.metrics
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1557,13 +1597,18 @@ class RayPPOTrainer:
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
-                                raise ValueError(
-                                    "Detected conflicting router replay configuration: "
-                                    "router_replay.mode='R2' and enable_rollout_routing_replay=True "
-                                    "cannot be enabled simultaneously. "
-                                    "The enable_rollout_routing_replay option is only used in R3 mode; "
-                                    "it should not be set when using R2 mode."
-                                )
+                                if self.router_mismatch_metrics_enabled:
+                                    metrics.update(self._maybe_compute_router_mismatch_metrics(batch, old_log_prob))
+                                    old_log_prob.batch.pop("routed_experts")
+                                    batch.batch.pop("routed_experts")
+                                else:
+                                    raise ValueError(
+                                        "Detected conflicting router replay configuration: "
+                                        "router_replay.mode='R2' and enable_rollout_routing_replay=True "
+                                        "cannot be enabled simultaneously. "
+                                        "The enable_rollout_routing_replay option is only used in R3 mode; "
+                                        "it should not be set when using R2 mode."
+                                    )
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.

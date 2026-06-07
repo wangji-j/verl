@@ -347,6 +347,9 @@ skip_tokenizer_init: True
 # When enabled (True), the rollout will record the routing decisions.
 enable_rollout_routing_replay: False
 
+# Whether to ask rollout engines to return per-token routed experts for metrics.
+enable_return_routed_experts: False
+
 
 # profile the rollout model in `generate_sequence`
 profiler:
