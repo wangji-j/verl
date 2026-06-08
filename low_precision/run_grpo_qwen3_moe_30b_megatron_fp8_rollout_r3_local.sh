@@ -9,37 +9,44 @@ export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
 export WANDB_MODE=${WANDB_MODE:-online}
+export NVTE_FP8_BLOCK_SCALING_FP32_SCALES=${NVTE_FP8_BLOCK_SCALING_FP32_SCALES:-1}
 
 run_timestamp=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
 project_name=${PROJECT_NAME:-jly-DAPO-DEEPSCALER-FP8-ROLLOUT}
-exp_name_base=${EXPERIMENT_NAME_BASE:-DAPO-DEEPSCALER-Qwen3-30B-A3B-INSTRUCT2507-VLLM-FP8-ROLLOUT-PBS256-N8-MINISTEP1-LR3E-6-30K-REFLOSS-AIMEAVG32}
+exp_name_base=${EXPERIMENT_NAME_BASE:-GRPO-DEEPSCALER-Qwen3-30B-A3B-base-MEGATRON-VLLM-FP8-ROLLOUT-R3-16K}
 exp_name=${EXPERIMENT_NAME:-${exp_name_base}_${run_timestamp}}
+trainer_logger=${TRAINER_LOGGER:-'["console","tensorboard","wandb"]'}
 
 adv_estimator=grpo
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=False
-kl_loss_coef=${KL_LOSS_COEF:-0.0}
+use_kl_loss=True
+kl_loss_coef=${KL_LOSS_COEF:-0.001}
 kl_loss_type=${KL_LOSS_TYPE:-low_var_kl}
 
 clip_ratio_low=0.2
 clip_ratio_high=0.27
 
+# Keep rollout correction off. This script is for router replay R3 only.
 rollout_is=null
 rollout_is_threshold=null
+rollout_is_batch_normalize=false
 rollout_rs=null
 rollout_rs_threshold=null
 
+routing_replay_mode=${ROUTING_REPLAY_MODE:-R3}
+enable_rollout_routing_replay=${ENABLE_ROLLOUT_ROUTING_REPLAY:-True}
+
 max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
-max_response_length=${MAX_RESPONSE_LENGTH:-$((30 * 1024))}
+max_response_length=${MAX_RESPONSE_LENGTH:-$((16 * 1024))}
 enable_overlong_buffer=False
 overlong_buffer_len=512
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
-enable_filter_groups=True
+enable_filter_groups=False
 filter_groups_metric=acc
 max_num_gen_batches=${MAX_NUM_GEN_BATCHES:-0}
 train_prompt_bsz=${TRAIN_PROMPT_BSZ:-256}
@@ -47,12 +54,12 @@ n_resp_per_prompt=${N_RESP_PER_PROMPT:-8}
 train_prompt_mini_bsz=${TRAIN_PROMPT_MINI_BSZ:-256}
 gen_prompt_bsz=${GEN_PROMPT_BSZ:-256}
 
-WORKING_DIR=${WORKING_DIR:-"/inspire/hdd/project/qianghuaxuexi/public/jly-verl"}
+WORKING_DIR=${WORKING_DIR:-"/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/jly-verl"}
 RECIPE_DIR=${RECIPE_DIR:-"/inspire/hdd/project/qianghuaxuexi/public/verl-low"}
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/inspire/hdd/project/qianghuaxuexi/public"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B-Instruct-2507"}
-CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B"}
+CKPTS_DIR=${CKPTS_DIR:-"/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/ckpts/${project_name}/${exp_name}"}
 GSM8K_DIR=${GSM8K_DIR:-"${RAY_DATA_HOME}/datasets/gsm8k"}
 DEEPSCALER_DIR=${DEEPSCALER_DIR:-"${RAY_DATA_HOME}/datasets/deepscaler"}
 TRAIN_FILE=${TRAIN_FILE:-"${DEEPSCALER_DIR}/train.parquet"}
@@ -73,21 +80,28 @@ temperature=1.0
 top_p=1.0
 top_k=-1
 
-sp_size=${SP_SIZE:-4}
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 actor_lr=${ACTOR_LR:-3e-6}
 offload=${OFFLOAD:-true}
-fsdp_size=${FSDP_SIZE:-16}
+
+# Engine-only replacement for the original FSDP settings.
+train_tp=${TRAIN_TP:-4}
+train_pp=${TRAIN_PP:-1}
+train_ep=${TRAIN_EP:-4}
+train_etp=${TRAIN_ETP:-2}
+
 gen_tp=${GEN_TP:-2}
 rollout_gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.85}
 rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
 rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-128}
-rollout_enforce_eager=${ROLLOUT_ENFORCE_EAGER:-False}
+rollout_enforce_eager=${ROLLOUT_ENFORCE_EAGER:-True}
+rollout_compilation_mode=${ROLLOUT_COMPILATION_MODE:-NONE}
+rollout_cudagraph_mode=${ROLLOUT_CUDAGRAPH_MODE:-NONE}
 val_before_train=${VAL_BEFORE_TRAIN:-True}
 test_freq=${TEST_FREQ:-10}
-save_freq=${SAVE_FREQ:-20}
+save_freq=${SAVE_FREQ:-50}
 total_training_steps=${TOTAL_TRAINING_STEPS:-500}
 
 export PYTHONPATH="${RECIPE_DIR}:${WORKING_DIR}:${PYTHONPATH:-}"
@@ -95,7 +109,12 @@ export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-INFO}
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
 export VLLM_CONFIGURE_LOGGING=${VLLM_CONFIGURE_LOGGING:-1}
 export VLLM_USE_V1=${VLLM_USE_V1:-1}
-export VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM:-1}
+# vLLM DeepGEMM FP8 MoE can crash during the V1 profiling/compile path with
+# "Cannot access data pointer of Tensor that doesn't have storage". Keep FP8
+# rollout enabled, but default to the safer vLLM MoE backend for this recipe.
+export VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM:-0}
+export VLLM_USE_DEEP_GEMM_E8M0=${VLLM_USE_DEEP_GEMM_E8M0:-0}
+export VERL_DISABLE_BROKEN_DEEP_EP=${VERL_DISABLE_BROKEN_DEEP_EP:-1}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export TORCH_NCCL_AVOID_RECORD_STREAMS=${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}
 
@@ -104,6 +123,7 @@ mkdir -p "${CKPTS_DIR}" "${CKPTS_DIR}/run_logs"
 
 TRAINING_CMD=(
     python3 -m dapo.main_dapo
+    --config-name=dapo_megatron_trainer
     data.train_files="${TRAIN_FILE}"
     data.val_files="${TEST_FILE}"
     data.prompt_key=prompt
@@ -124,6 +144,7 @@ TRAINING_CMD=(
     algorithm.filter_groups.metric=${filter_groups_metric}
     algorithm.rollout_correction.rollout_is=${rollout_is}
     algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold}
+    algorithm.rollout_correction.rollout_is_batch_normalize=${rollout_is_batch_normalize}
     algorithm.rollout_correction.rollout_rs=${rollout_rs}
     algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold}
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss}
@@ -137,7 +158,7 @@ TRAINING_CMD=(
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2
     actor_rollout_ref.model.path="${MODEL_PATH}"
     actor_rollout_ref.model.use_remove_padding=True
-    actor_rollout_ref.model.enable_gradient_checkpointing=True
+    actor_rollout_ref.model.use_fused_kernels=False
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz}
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len}
@@ -145,14 +166,27 @@ TRAINING_CMD=(
     actor_rollout_ref.actor.optim.lr=${actor_lr}
     actor_rollout_ref.actor.optim.weight_decay=0.1
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz}
-    actor_rollout_ref.actor.fsdp_config.param_offload=${offload}
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload}
+    actor_rollout_ref.actor.megatron.param_offload=${offload}
+    actor_rollout_ref.actor.megatron.optimizer_offload=${offload}
+    actor_rollout_ref.actor.megatron.grad_offload=${offload}
+    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp}
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp}
+    actor_rollout_ref.actor.megatron.expert_model_parallel_size=${train_ep}
+    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${train_etp}
+    actor_rollout_ref.actor.megatron.use_remove_padding=True
+    actor_rollout_ref.actor.megatron.dtype=bfloat16
+    actor_rollout_ref.actor.megatron.router_replay.mode=${routing_replay_mode}
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
+    +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.optim.clip_grad=1.0
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode}
-    actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size}
+    actor_rollout_ref.actor.megatron.use_mbridge=True
+    actor_rollout_ref.actor.megatron.vanilla_mbridge=True
     actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_memory_utilization}
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp}
+    actor_rollout_ref.rollout.expert_parallel_size=1
     actor_rollout_ref.rollout.enable_chunked_prefill=True
     actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens}
     actor_rollout_ref.rollout.max_num_seqs=${rollout_max_num_seqs}
@@ -168,16 +202,23 @@ TRAINING_CMD=(
     actor_rollout_ref.rollout.name=vllm
     actor_rollout_ref.rollout.mode=async
     actor_rollout_ref.rollout.calculate_log_probs=True
-    actor_rollout_ref.ref.fsdp_config.param_offload=${offload}
-    actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size}
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size}
+    actor_rollout_ref.rollout.enable_rollout_routing_replay=${enable_rollout_routing_replay}
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.mode=${rollout_compilation_mode}
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=${rollout_cudagraph_mode}
+    actor_rollout_ref.ref.megatron.param_offload=${offload}
+    actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp}
+    actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp}
+    actor_rollout_ref.ref.megatron.expert_model_parallel_size=${train_ep}
+    actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${train_etp}
+    actor_rollout_ref.ref.megatron.use_remove_padding=True
+    actor_rollout_ref.ref.megatron.dtype=bfloat16
     reward.reward_manager.name=dapo
     reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer}
     reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len}
     reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor}
     reward.reward_kwargs.overlong_buffer_cfg.log=False
     reward.reward_kwargs.max_resp_len=${max_response_length}
-    trainer.logger='["console","tensorboard","wandb"]'
+    trainer.logger=${trainer_logger}
     trainer.project_name="${project_name}"
     trainer.experiment_name="${exp_name}"
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}
@@ -191,6 +232,7 @@ TRAINING_CMD=(
     trainer.log_val_generations=1
     trainer.total_training_steps=${total_training_steps}
     trainer.max_actor_ckpt_to_keep=5
+    +trainer.use_legacy_worker_impl=disable
     actor_rollout_ref.rollout.enforce_eager=${rollout_enforce_eager}
     +ray_kwargs.ray_init.address=auto
 )
@@ -313,11 +355,12 @@ main() {
     export GLOO_SOCKET_TIMEOUT=${GLOO_SOCKET_TIMEOUT:-600}
     export GLOO_TCP_TIMEOUT=${GLOO_TCP_TIMEOUT:-600}
 
-    echo "[DAPO-FP8] model=${MODEL_PATH}"
-    echo "[DAPO-FP8] train=${TRAIN_FILE}"
-    echo "[DAPO-FP8] val=${TEST_FILE}"
-    echo "[DAPO-FP8] project=${project_name} experiment=${exp_name}"
-    echo "[DAPO-FP8] nnodes=${NNODES} node_rank=${NODE_RANK} gpus_per_node=${NGPUS_PER_NODE}"
+    echo "[DAPO-FP8-R3] model=${MODEL_PATH}"
+    echo "[DAPO-FP8-R3] train=${TRAIN_FILE}"
+    echo "[DAPO-FP8-R3] val=${TEST_FILE}"
+    echo "[DAPO-FP8-R3] project=${project_name} experiment=${exp_name}"
+    echo "[DAPO-FP8-R3] nnodes=${NNODES} node_rank=${NODE_RANK} gpus_per_node=${NGPUS_PER_NODE}"
+    echo "[DAPO-FP8-R3] router_replay=${routing_replay_mode} rollout_routing_replay=${enable_rollout_routing_replay}"
     echo "INFO: Ray temp dir: ${RAY_TMPDIR}"
 
     ray stop --force >/dev/null 2>&1 || true
@@ -325,7 +368,7 @@ main() {
     wait_for_ray_nodes
 
     if [ "${NODE_RANK}" = "0" ]; then
-        echo "INFO: Rank 0 launching DAPO FP8 rollout training with Ray address ${RAY_ADDRESS}"
+        echo "INFO: Rank 0 launching DAPO Megatron FP8 rollout R3 training with Ray address ${RAY_ADDRESS}"
         "${TRAINING_CMD[@]}" "$@"
         echo "INFO: Rank 0 training finished."
         sleep 30

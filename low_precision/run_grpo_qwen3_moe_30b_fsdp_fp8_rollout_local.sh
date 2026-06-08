@@ -12,15 +12,15 @@ export WANDB_MODE=${WANDB_MODE:-online}
 
 run_timestamp=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
 project_name=${PROJECT_NAME:-jly-DAPO-DEEPSCALER-FP8-ROLLOUT}
-exp_name_base=${EXPERIMENT_NAME_BASE:-DAPO-DEEPSCALER-Qwen3-30B-A3B-INSTRUCT2507-VLLM-FP8-ROLLOUT-PBS256-N8-MINISTEP1-LR3E-6-30K-REFLOSS-AIMEAVG32}
+exp_name_base=${EXPERIMENT_NAME_BASE:-GRPO-DEEPSCALER-Qwen3-30B-A3B-base-VLLM-FP8-ROLLOUT-16K}
 exp_name=${EXPERIMENT_NAME:-${exp_name_base}_${run_timestamp}}
 
 adv_estimator=grpo
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=False
-kl_loss_coef=${KL_LOSS_COEF:-0.0}
+use_kl_loss=True
+kl_loss_coef=${KL_LOSS_COEF:-0.001}
 kl_loss_type=${KL_LOSS_TYPE:-low_var_kl}
 
 clip_ratio_low=0.2
@@ -30,16 +30,17 @@ rollout_is=null
 rollout_is_threshold=null
 rollout_rs=null
 rollout_rs_threshold=null
+enable_rollout_routing_replay=False
 
 max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
-max_response_length=${MAX_RESPONSE_LENGTH:-$((30 * 1024))}
+max_response_length=${MAX_RESPONSE_LENGTH:-$((16 * 1024))}
 enable_overlong_buffer=False
 overlong_buffer_len=512
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
-enable_filter_groups=True
+enable_filter_groups=False
 filter_groups_metric=acc
 max_num_gen_batches=${MAX_NUM_GEN_BATCHES:-0}
 train_prompt_bsz=${TRAIN_PROMPT_BSZ:-256}
@@ -47,12 +48,12 @@ n_resp_per_prompt=${N_RESP_PER_PROMPT:-8}
 train_prompt_mini_bsz=${TRAIN_PROMPT_MINI_BSZ:-256}
 gen_prompt_bsz=${GEN_PROMPT_BSZ:-256}
 
-WORKING_DIR=${WORKING_DIR:-"/inspire/hdd/project/qianghuaxuexi/public/jly-verl"}
+WORKING_DIR=${WORKING_DIR:-"/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/jly-verl"}
 RECIPE_DIR=${RECIPE_DIR:-"/inspire/hdd/project/qianghuaxuexi/public/verl-low"}
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/inspire/hdd/project/qianghuaxuexi/public"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B-Instruct-2507"}
-CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B"}
+CKPTS_DIR=${CKPTS_DIR:-"/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/ckpts/${project_name}/${exp_name}"}
 GSM8K_DIR=${GSM8K_DIR:-"${RAY_DATA_HOME}/datasets/gsm8k"}
 DEEPSCALER_DIR=${DEEPSCALER_DIR:-"${RAY_DATA_HOME}/datasets/deepscaler"}
 TRAIN_FILE=${TRAIN_FILE:-"${DEEPSCALER_DIR}/train.parquet"}
@@ -87,7 +88,7 @@ rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-128}
 rollout_enforce_eager=${ROLLOUT_ENFORCE_EAGER:-False}
 val_before_train=${VAL_BEFORE_TRAIN:-True}
 test_freq=${TEST_FREQ:-10}
-save_freq=${SAVE_FREQ:-20}
+save_freq=${SAVE_FREQ:-50}
 total_training_steps=${TOTAL_TRAINING_STEPS:-500}
 
 export PYTHONPATH="${RECIPE_DIR}:${WORKING_DIR}:${PYTHONPATH:-}"
@@ -168,6 +169,7 @@ TRAINING_CMD=(
     actor_rollout_ref.rollout.name=vllm
     actor_rollout_ref.rollout.mode=async
     actor_rollout_ref.rollout.calculate_log_probs=True
+    actor_rollout_ref.rollout.enable_rollout_routing_replay=${enable_rollout_routing_replay}
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload}
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size}
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size}
