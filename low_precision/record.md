@@ -634,3 +634,29 @@ metric_mode: exact_set
 ```
 
 相比原来的 `core` 模式，新模式会包含 top-k 排序、alignment train 副本构造、全局 token match rate、逐层 match rate、sequence mismatch 统计等步骤，更接近训练时 `timing_s/router_mismatch_metrics` 的实际执行路径。新增 `--output-json` 用于把结果保存为结构化文件。
+
+### 2026-06-23: DAPOTaskRunner CPU 数可配置
+
+将 DAPO trainer 所在的 Ray actor 从固定 `num_cpus=1` 改为环境变量控制：
+
+```bash
+DAPO_TASK_RUNNER_NUM_CPUS
+```
+
+改动文件：
+
+```bash
+dapo/main_dapo.py
+low_precision/run_grpo_qwen3_moe_30b_megatron_fp8_rollout_seqRS_threshold.sh
+```
+
+Python 入口兜底默认值为 `32`；`run_grpo_qwen3_moe_30b_megatron_fp8_rollout_seqRS_threshold.sh` 脚本默认导出 `64`。脚本同步设置：
+
+```bash
+OMP_NUM_THREADS=${DAPO_TASK_RUNNER_NUM_CPUS}
+MKL_NUM_THREADS=${DAPO_TASK_RUNNER_NUM_CPUS}
+OPENBLAS_NUM_THREADS=${DAPO_TASK_RUNNER_NUM_CPUS}
+NUMEXPR_NUM_THREADS=${DAPO_TASK_RUNNER_NUM_CPUS}
+```
+
+目的：让 `router_mismatch_metrics` 这类在 DAPOTaskRunner/trainer 进程内执行的 CPU 大张量计算不再被 Ray actor 的 `num_cpus=1` 和单线程 CPU kernel 限制。

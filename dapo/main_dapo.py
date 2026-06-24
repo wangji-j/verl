@@ -110,7 +110,8 @@ class DAPOTaskRunner(TaskRunner):
 def main(config):
     auto_set_device(config)
     config = migrate_legacy_reward_impl(config)
-    run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(DAPOTaskRunner))
+    task_runner_num_cpus = int(os.environ.get("DAPO_TASK_RUNNER_NUM_CPUS", "32"))
+    run_ppo(config, task_runner_class=ray.remote(num_cpus=task_runner_num_cpus)(DAPOTaskRunner))
 
 
 if __name__ == "__main__":
