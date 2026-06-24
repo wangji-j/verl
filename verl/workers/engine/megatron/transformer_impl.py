@@ -115,10 +115,14 @@ class MegatronEngine(BaseEngine):
                 )
             logger.info(f"QAT enabled in MegatronEngine: mode={self._qat_config.mode}")
 
-        # Router replay configuration for MoE models
+        # Router replay / mismatch metrics configuration for MoE models
         self.enable_routing_replay = self.engine_config.router_replay.mode != "disabled"
+        self.enable_router_mismatch_metrics = bool(
+            getattr(self.engine_config, "router_mismatch_metrics_enabled", False)
+        )
         logger.info(f"enable_routing_replay in MegatronEngine: {self.enable_routing_replay}")
-        if self.enable_routing_replay:
+        logger.info(f"enable_router_mismatch_metrics in MegatronEngine: {self.enable_router_mismatch_metrics}")
+        if self.enable_routing_replay or self.enable_router_mismatch_metrics:
             apply_router_replay_patch()
             self.mini_layer_topk_idx_list = []
         # Apply checkpoint patch for MoE models
@@ -220,7 +224,7 @@ class MegatronEngine(BaseEngine):
             }
             for key, value in override_transformer_config.items():
                 provider_overrides[key] = value
-            if self.enable_routing_replay:
+            if self.enable_routing_replay or self.enable_router_mismatch_metrics:
                 provider_overrides["enable_routing_replay"] = True
 
             if self._qat_enabled:
@@ -243,7 +247,7 @@ class MegatronEngine(BaseEngine):
         # override_transformer_config, because dataclass subclasses like MLATransformerConfig
         # generate their own __init__ and don't inherit the patched TransformerConfig.__init__
         # that accepts this kwarg.
-        if self.enable_routing_replay and tf_config is not None:
+        if (self.enable_routing_replay or self.enable_router_mismatch_metrics) and tf_config is not None:
             tf_config.enable_routing_replay = True
 
         if torch.distributed.get_rank() == 0:
@@ -308,8 +312,8 @@ class MegatronEngine(BaseEngine):
         if torch.distributed.get_rank() == 0:
             print_model_size(module[0])
 
-        if self.enable_routing_replay:
-            print(f"routing replay layers: {len(RouterReplay.router_instances)}")
+        if self.enable_routing_replay or self.enable_router_mismatch_metrics:
+            print(f"routing replay/metrics layers: {len(RouterReplay.router_instances)}")
 
         return module
 
@@ -662,6 +666,9 @@ class MegatronEngine(BaseEngine):
             if forward_only and self.engine_config.router_replay.mode == "R2":
                 # In R2 mode, forward_only calls (e.g., compute_log_probs) need to record routing information
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        elif forward_only and self.enable_router_mismatch_metrics:
+            # Metrics-only mode: record actor routing during compute_log_prob without enabling replay.
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
         # batch should be a list of batches inside micro-batches
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
@@ -712,7 +719,7 @@ class MegatronEngine(BaseEngine):
             output = postprocess_batch_func(output_lst=losses_reduced, indices=indices, data=data)
             if RouterReplayHelper.is_r2_record_action(self.tf_config):
                 output["model_output"]["routed_experts"] = layers_topk_idx
-        if enable_routing_replay:
+        if enable_routing_replay or self.enable_router_mismatch_metrics:
             RouterReplay.clear_global_indices()
             RouterReplay.clear_global_router_replay_action()
         return output

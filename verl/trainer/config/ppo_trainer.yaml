@@ -52,6 +52,28 @@ router:
   # Whether to compare rollout and training MoE router choices.
   enable_mismatch_metrics: False
 
+  # Whether to drop whole responses whose sequence-level router mismatch exceeds a threshold.
+  enable_mismatch_rs: False
+
+  # Sequence-level router mismatch threshold. The score is the response average
+  # of per-token mismatched-layer fraction, so it ranges from 0.0 to 1.0.
+  mismatch_rs_threshold: 0.8
+
+  # Router mismatch rejection mode:
+  # - threshold: drop responses whose seq_mismatch exceeds mismatch_rs_threshold.
+  # - top_fraction: drop the highest mismatch_rs_fraction fraction in each batch.
+  mismatch_rs_mode: threshold
+  mismatch_rs_fraction: 0.1
+
+  # Sequence mismatch metric mode:
+  # - exact_set: a layer mismatches unless the full top-k expert set is identical.
+  # - overlap_fraction: layer_mismatch = 1 - top-k overlap / top-k.
+  mismatch_metric_mode: exact_set
+
+  # Number of router-mismatch steps used to pick the best token alignment from
+  # {0, -1, 1}. After warmup, the trainer reuses the frozen alignment.
+  mismatch_alignment_warmup_steps: 3
+
 # config for actor, rollout and reference model
 actor_rollout_ref:
 

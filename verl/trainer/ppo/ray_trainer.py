@@ -19,7 +19,9 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
+import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -333,12 +335,16 @@ class RayPPOTrainer:
         self.router_mismatch_metrics_enabled = bool(
             OmegaConf.select(self.config, "router.enable_mismatch_metrics", default=False)
         )
+        self._router_mismatch_alignment_sums: dict[int, float] = defaultdict(float)
+        self._router_mismatch_alignment_counts: dict[int, int] = defaultdict(int)
+        self._router_mismatch_alignment_observations = 0
+        self._router_mismatch_frozen_alignment: int | None = None
         if self.router_mismatch_metrics_enabled:
             actor_strategy = OmegaConf.select(self.config, "actor_rollout_ref.actor.strategy")
             rollout_name = OmegaConf.select(self.config, "actor_rollout_ref.rollout.name")
-            if actor_strategy not in {"fsdp", "fsdp2"}:
+            if actor_strategy not in {"fsdp", "fsdp2", "megatron"}:
                 raise ValueError(
-                    "router.enable_mismatch_metrics requires FSDP actor strategy; "
+                    "router.enable_mismatch_metrics requires FSDP or Megatron actor strategy; "
                     f"got actor_rollout_ref.actor.strategy={actor_strategy!r}"
                 )
             if rollout_name != "vllm":
@@ -392,6 +398,31 @@ class RayPPOTrainer:
 
         self.checkpoint_manager = None
         self._init_dump_executor()
+
+    def _perf_debug_dir(self) -> str:
+        return os.getenv("VERL_PERF_DEBUG_DIR", "").strip()
+
+    def _write_perf_debug(self, name: str, row: dict[str, Any]) -> None:
+        debug_dir = self._perf_debug_dir()
+        if not debug_dir:
+            return
+        os.makedirs(debug_dir, exist_ok=True)
+        global_step = int(getattr(self, "global_steps", -1))
+        payload = {"global_step": global_step, "debug_name": name, **row}
+        path = os.path.join(debug_dir, f"{name}_step{global_step:04d}.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+    @staticmethod
+    def _cuda_memory_snapshot(device: torch.device | None = None) -> dict[str, float]:
+        if not torch.cuda.is_available():
+            return {}
+        if device is None or device.type != "cuda":
+            device = torch.device("cuda")
+        return {
+            "cuda_memory_allocated_gb": torch.cuda.memory_allocated(device) / (1024**3),
+            "cuda_memory_reserved_gb": torch.cuda.memory_reserved(device) / (1024**3),
+        }
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -619,6 +650,11 @@ class RayPPOTrainer:
         return batch_reward
 
     def _validate(self, merged: bool = False):
+        validate_t0 = time.perf_counter()
+        validate_generate_s = 0.0
+        validate_decode_s = 0.0
+        validate_reward_s = 0.0
+        validate_response_lengths = []
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -662,7 +698,9 @@ class RayPPOTrainer:
             # pad to be divisible by dp_size
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            generate_t0 = time.perf_counter()
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            validate_generate_s += time.perf_counter() - generate_t0
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
@@ -680,7 +718,12 @@ class RayPPOTrainer:
             print("validation generation end")
 
             # Store generated outputs
+            decode_t0 = time.perf_counter()
             output_ids = test_output_gen_batch.batch["responses"]
+            pad_token_id = self.tokenizer.pad_token_id
+            if pad_token_id is not None:
+                lengths = (output_ids != pad_token_id).sum(dim=-1).cpu().tolist()
+                validate_response_lengths.extend(int(length) for length in lengths)
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
@@ -693,9 +736,12 @@ class RayPPOTrainer:
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            validate_decode_s += time.perf_counter() - decode_t0
 
             # evaluate using reward_function
+            reward_t0 = time.perf_counter()
             reward_tensor, reward_extra_info = extract_reward(test_batch)
+            validate_reward_s += time.perf_counter() - reward_t0
 
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
@@ -715,7 +761,28 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
+        log_t0 = time.perf_counter()
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        validate_log_s = time.perf_counter() - log_t0
+        validate_total_s = time.perf_counter() - validate_t0
+        length_arr = np.asarray(validate_response_lengths, dtype=np.float64)
+        max_response_length = int(self.config.data.max_response_length)
+        num_tokens = int(length_arr.sum()) if length_arr.size > 0 else 0
+        perf_debug_row = {
+            "total_s": validate_total_s,
+            "generate_s": validate_generate_s,
+            "decode_s": validate_decode_s,
+            "reward_s": validate_reward_s,
+            "log_generations_s": validate_log_s,
+            "num_responses": int(length_arr.size),
+            "num_response_tokens": num_tokens,
+            "time_per_token_s": validate_total_s / max(num_tokens, 1),
+            "response_length_mean": float(length_arr.mean()) if length_arr.size > 0 else 0.0,
+            "response_length_max": float(length_arr.max()) if length_arr.size > 0 else 0.0,
+            "response_clip_ratio": float((length_arr >= max_response_length).mean()) if length_arr.size > 0 else 0.0,
+            **{f"after_validate_{k}": v for k, v in self._cuda_memory_snapshot().items()},
+        }
+        self._write_perf_debug("validation", perf_debug_row)
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -1314,21 +1381,189 @@ class RayPPOTrainer:
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
 
+    def _router_mismatch_rs_enabled(self) -> bool:
+        return bool(OmegaConf.select(self.config, "router.enable_mismatch_rs", default=False))
+
+    def _router_mismatch_rs_threshold(self) -> float:
+        return float(OmegaConf.select(self.config, "router.mismatch_rs_threshold", default=0.8))
+
+    def _router_mismatch_rs_mode(self) -> str:
+        return str(OmegaConf.select(self.config, "router.mismatch_rs_mode", default="threshold"))
+
+    def _router_mismatch_rs_fraction(self) -> float:
+        return float(OmegaConf.select(self.config, "router.mismatch_rs_fraction", default=0.1))
+
+    def _router_mismatch_metric_mode(self) -> str:
+        return str(OmegaConf.select(self.config, "router.mismatch_metric_mode", default="exact_set"))
+
+    def _router_mismatch_alignment_warmup_steps(self) -> int:
+        return int(OmegaConf.select(self.config, "router.mismatch_alignment_warmup_steps", default=3))
+
     def _maybe_compute_router_mismatch_metrics(self, batch: DataProto, old_log_prob: DataProto) -> dict[str, float]:
+        result = self._compute_router_mismatch_result(batch, old_log_prob)
+        return result.metrics if result is not None else {}
+
+    def _compute_router_mismatch_result(self, batch: DataProto, old_log_prob: DataProto):
         if not self.router_mismatch_metrics_enabled:
-            return {}
+            return None
         if "routed_experts" not in batch.batch:
             raise RuntimeError("router.enable_mismatch_metrics requires rollout routed_experts from vLLM.")
         if "routed_experts" not in old_log_prob.batch:
-            raise RuntimeError("router.enable_mismatch_metrics requires FSDP routed_experts from old_log_prob.")
+            raise RuntimeError("router.enable_mismatch_metrics requires actor routed_experts from old_log_prob.")
 
-        result = compute_router_mismatch_metrics(
-            batch.batch["routed_experts"],
-            old_log_prob.batch["routed_experts"],
-            batch.batch["response_mask"],
-            metric_prefix="router/rollout_vs_train",
+        rollout_routes = batch.batch["routed_experts"]
+        train_routes = old_log_prob.batch["routed_experts"]
+        response_mask = batch.batch["response_mask"]
+        debug_device = train_routes.device if getattr(train_routes, "is_cuda", False) else rollout_routes.device
+        debug_before = self._cuda_memory_snapshot(debug_device)
+        debug_t0 = time.perf_counter()
+        alignments = (
+            (self._router_mismatch_frozen_alignment,)
+            if self._router_mismatch_frozen_alignment is not None
+            else (0, -1, 1)
         )
-        return result.metrics
+        result = compute_router_mismatch_metrics(
+            rollout_routes,
+            train_routes,
+            response_mask,
+            metric_prefix="router/rollout_vs_train",
+            alignments=alignments,
+            metric_mode=self._router_mismatch_metric_mode(),
+        )
+        debug_after = self._cuda_memory_snapshot(debug_device)
+        self._write_perf_debug(
+            "router_mismatch",
+            {
+                "duration_s": time.perf_counter() - debug_t0,
+                "metric_mode": self._router_mismatch_metric_mode(),
+                "alignments": list(alignments),
+                "selected_alignment": result.alignment,
+                "alignment_frozen_before": self._router_mismatch_frozen_alignment is not None,
+                "rollout_routes_shape": list(rollout_routes.shape),
+                "train_routes_shape": list(train_routes.shape),
+                "response_mask_shape": list(response_mask.shape),
+                "response_mask_tokens": int(response_mask.sum().item()),
+                "rollout_routes_dtype": str(rollout_routes.dtype),
+                "train_routes_dtype": str(train_routes.dtype),
+                "rollout_routes_device": str(rollout_routes.device),
+                "train_routes_device": str(train_routes.device),
+                **{f"before_{k}": v for k, v in debug_before.items()},
+                **{f"after_{k}": v for k, v in debug_after.items()},
+            },
+        )
+        self._update_router_mismatch_alignment_state(result)
+        return result
+
+    def _update_router_mismatch_alignment_state(self, router_result) -> None:
+        metrics = router_result.metrics
+        metrics["router/rollout_vs_train/selected_alignment"] = float(router_result.alignment)
+        metrics["router/rollout_vs_train/alignment_frozen"] = float(
+            self._router_mismatch_frozen_alignment is not None
+        )
+        if self._router_mismatch_frozen_alignment is not None:
+            return
+
+        scores = router_result.alignment_scores or {}
+        if not scores:
+            return
+
+        for alignment, score in scores.items():
+            self._router_mismatch_alignment_sums[int(alignment)] += float(score)
+            self._router_mismatch_alignment_counts[int(alignment)] += 1
+
+        self._router_mismatch_alignment_observations += 1
+
+        warmup_steps = max(self._router_mismatch_alignment_warmup_steps(), 1)
+        if self._router_mismatch_alignment_observations >= warmup_steps:
+            averages = {
+                alignment: self._router_mismatch_alignment_sums[alignment] / max(count, 1)
+                for alignment, count in self._router_mismatch_alignment_counts.items()
+            }
+            self._router_mismatch_frozen_alignment = max(averages, key=lambda alignment: averages[alignment])
+            metrics["router/rollout_vs_train/frozen_alignment"] = float(self._router_mismatch_frozen_alignment)
+            metrics["router/rollout_vs_train/alignment_frozen"] = 1.0
+
+    def _apply_router_mismatch_rs(self, batch: DataProto, router_result) -> dict[str, float]:
+        if (
+            not self._router_mismatch_rs_enabled()
+            or router_result is None
+            or router_result.seq_mismatch is None
+            or router_result.seq_valid_token_count is None
+        ):
+            return {}
+
+        seq_mismatch = router_result.seq_mismatch.to(device=batch.batch["response_mask"].device)
+        seq_valid_token_count = router_result.seq_valid_token_count.to(device=batch.batch["response_mask"].device)
+        valid_seq = seq_valid_token_count > 0
+        mode = self._router_mismatch_rs_mode()
+        threshold = self._router_mismatch_rs_threshold()
+        fraction = self._router_mismatch_rs_fraction()
+
+        if mode == "threshold":
+            reject = valid_seq & (seq_mismatch > threshold)
+            effective_threshold = threshold
+        elif mode == "top_fraction":
+            reject = torch.zeros_like(valid_seq, dtype=torch.bool)
+            valid_indices = torch.nonzero(valid_seq, as_tuple=False).flatten()
+            valid_count_for_topk = int(valid_indices.numel())
+            if fraction > 0 and valid_count_for_topk > 0:
+                k = min(max(math.ceil(valid_count_for_topk * fraction), 1), valid_count_for_topk)
+                valid_scores = seq_mismatch[valid_indices]
+                topk_values, topk_pos = torch.topk(valid_scores, k=k, largest=True, sorted=False)
+                reject[valid_indices[topk_pos]] = True
+                effective_threshold = float(topk_values.min().item())
+            else:
+                effective_threshold = 0.0
+        else:
+            raise ValueError(
+                "router.mismatch_rs_mode must be 'threshold' or 'top_fraction', "
+                f"got {mode!r}"
+            )
+
+        response_mask = batch.batch["response_mask"]
+        reject = reject.to(device=response_mask.device)
+        if bool(reject.any().item()):
+            response_mask[reject] = 0
+
+        valid_count = int(valid_seq.sum().item())
+        rejected_count = int(reject.sum().item())
+        kept_count = max(valid_count - rejected_count, 0)
+        rejected_fraction = float(rejected_count / valid_count) if valid_count > 0 else 0.0
+        metrics = {
+            "router/rollout_vs_train/rs_threshold": effective_threshold,
+            "router/rollout_vs_train/rs_config_threshold": threshold,
+            "router/rollout_vs_train/rs_top_fraction": fraction if mode == "top_fraction" else 0.0,
+            "router/rollout_vs_train/rs_rejected_fraction": rejected_fraction,
+            "router/rollout_vs_train/rs_rejected_count": float(rejected_count),
+            "router/rollout_vs_train/rs_kept_count": float(kept_count),
+        }
+
+        uids = batch.non_tensor_batch.get("uid") if hasattr(batch, "non_tensor_batch") else None
+        if uids is not None and len(uids) == int(reject.numel()):
+            valid_list = valid_seq.detach().cpu().tolist()
+            reject_list = reject.detach().cpu().tolist()
+            prompt_total: dict[object, int] = {}
+            prompt_rejected: dict[object, int] = {}
+            for uid, is_valid, is_rejected in zip(uids, valid_list, reject_list, strict=False):
+                if not is_valid:
+                    continue
+                uid_key = uid.item() if hasattr(uid, "item") else uid
+                try:
+                    hash(uid_key)
+                except TypeError:
+                    uid_key = str(uid_key)
+                prompt_total[uid_key] = prompt_total.get(uid_key, 0) + 1
+                prompt_rejected[uid_key] = prompt_rejected.get(uid_key, 0) + int(bool(is_rejected))
+            if prompt_total:
+                all_rejected = sum(
+                    1 for uid, total in prompt_total.items() if total > 0 and prompt_rejected.get(uid, 0) == total
+                )
+                metrics["router/rollout_vs_train/rs_prompt_all_rejected_fraction"] = float(
+                    all_rejected / len(prompt_total)
+                )
+                metrics["router/rollout_vs_train/rs_prompt_all_rejected_count"] = float(all_rejected)
+
+        return metrics
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1580,7 +1815,8 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            with marked_timer("old_log_prob_forward", timing_raw, color="blue"):
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1596,19 +1832,30 @@ class RayPPOTrainer:
                             }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
-                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
-                                if self.router_mismatch_metrics_enabled:
-                                    metrics.update(self._maybe_compute_router_mismatch_metrics(batch, old_log_prob))
+                            if self.router_mismatch_metrics_enabled:
+                                missing_routed_experts = []
+                                if "routed_experts" not in batch.batch:
+                                    missing_routed_experts.append("rollout/vLLM batch.routed_experts")
+                                if "routed_experts" not in old_log_prob.batch:
+                                    missing_routed_experts.append("actor old_log_prob.routed_experts")
+                                if missing_routed_experts:
+                                    raise RuntimeError(
+                                        "router.enable_mismatch_metrics=True but routed_experts is missing from: "
+                                        + ", ".join(missing_routed_experts)
+                                    )
+                                else:
+                                    with marked_timer("router_mismatch_metrics", timing_raw, color="blue"):
+                                        metrics.update(self._maybe_compute_router_mismatch_metrics(batch, old_log_prob))
                                     old_log_prob.batch.pop("routed_experts")
                                     batch.batch.pop("routed_experts")
-                                else:
-                                    raise ValueError(
-                                        "Detected conflicting router replay configuration: "
-                                        "router_replay.mode='R2' and enable_rollout_routing_replay=True "
-                                        "cannot be enabled simultaneously. "
-                                        "The enable_rollout_routing_replay option is only used in R3 mode; "
-                                        "it should not be set when using R2 mode."
-                                    )
+                            elif "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+                                raise ValueError(
+                                    "Detected conflicting router replay configuration: "
+                                    "router_replay.mode='R2' and enable_rollout_routing_replay=True "
+                                    "cannot be enabled simultaneously. "
+                                    "The enable_rollout_routing_replay option is only used in R3 mode; "
+                                    "it should not be set when using R2 mode."
+                                )
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
