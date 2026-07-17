@@ -11,15 +11,10 @@ export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
 # WANDB_API_KEY is read from the environment or an existing W&B login.
 export WANDB_MODE=${WANDB_MODE:-online}
 export NVTE_FP8_BLOCK_SCALING_FP32_SCALES=${NVTE_FP8_BLOCK_SCALING_FP32_SCALES:-1}
-export DAPO_TASK_RUNNER_NUM_CPUS=${DAPO_TASK_RUNNER_NUM_CPUS:-64}
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-${DAPO_TASK_RUNNER_NUM_CPUS}}
-export MKL_NUM_THREADS=${MKL_NUM_THREADS:-${DAPO_TASK_RUNNER_NUM_CPUS}}
-export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-${DAPO_TASK_RUNNER_NUM_CPUS}}
-export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-${DAPO_TASK_RUNNER_NUM_CPUS}}
 
 run_timestamp=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
 project_name=${PROJECT_NAME:-jly-DAPO-DEEPSCALER-FP8-ROLLOUT}
-exp_name_base=${EXPERIMENT_NAME_BASE:-GRPO-DEEPSCALER-Qwen3-30B-A3B-base-MEGATRON-VLLM-FP8-sequence-mismatch-threshold0.25}
+exp_name_base=${EXPERIMENT_NAME_BASE:-GRPO-DEEPSCALER-Qwen3-30B-A3B-base-MEGATRON-VLLM-FP8-usage-l1-lengthbucket-top8RS-TIS-C2-16K}
 exp_name=${EXPERIMENT_NAME:-${exp_name_base}_${run_timestamp}}
 trainer_logger=${TRAINER_LOGGER:-'["console","tensorboard","wandb"]'}
 
@@ -34,17 +29,22 @@ kl_loss_type=${KL_LOSS_TYPE:-low_var_kl}
 clip_ratio_low=0.2
 clip_ratio_high=0.27
 
-# Keep router replay off for the baseline; disable TIS correction.
-rollout_is=null
-rollout_is_threshold=null
+rollout_is=token
+rollout_is_threshold=2.0
 rollout_is_batch_normalize=false
 rollout_rs=null
 rollout_rs_threshold=null
 
 enable_rollout_routing_replay=${ENABLE_ROLLOUT_ROUTING_REPLAY:-False}
 enable_router_mismatch_rs=${ENABLE_ROUTER_MISMATCH_RS:-True}
-router_mismatch_rs_threshold=${ROUTER_MISMATCH_RS_THRESHOLD:-0.25}
+router_mismatch_rs_threshold=${ROUTER_MISMATCH_RS_THRESHOLD:-0.0}
+router_mismatch_rs_mode=${ROUTER_MISMATCH_RS_MODE:-length_bucket_top_fraction}
+router_mismatch_rs_fraction=${ROUTER_MISMATCH_RS_FRACTION:-0.08}
+router_mismatch_rs_length_bucket_edges=${ROUTER_MISMATCH_RS_LENGTH_BUCKET_EDGES:-"[2048,4096,8192,12288]"}
+router_mismatch_metric_mode=${ROUTER_MISMATCH_METRIC_MODE:-expert_usage_l1}
 router_mismatch_alignment_warmup_steps=${ROUTER_MISMATCH_ALIGNMENT_WARMUP_STEPS:-1}
+router_expert_usage_smoothing_tau=${ROUTER_EXPERT_USAGE_SMOOTHING_TAU:-4096.0}
+router_expert_usage_num_experts=${ROUTER_EXPERT_USAGE_NUM_EXPERTS:-null}
 
 max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
 max_response_length=${MAX_RESPONSE_LENGTH:-$((16 * 1024))}
@@ -72,6 +72,13 @@ export VERL_REWARD_DEBUG_DIR=${VERL_REWARD_DEBUG_DIR:-"${CKPTS_DIR}/reward_debug
 export VERL_REWARD_DEBUG_STEPS=${VERL_REWARD_DEBUG_STEPS:-40}
 export VERL_REWARD_DEBUG_SAMPLES=${VERL_REWARD_DEBUG_SAMPLES:-16}
 export VERL_PERF_DEBUG_DIR=${VERL_PERF_DEBUG_DIR:-"${CKPTS_DIR}/perf_debug"}
+export VERL_ROUTER_ANALYSIS_DUMP_DIR=${VERL_ROUTER_ANALYSIS_DUMP_DIR:-"${CKPTS_DIR}/router_analysis_dump"}
+export VERL_ROUTER_ANALYSIS_DUMP_MODE=${VERL_ROUTER_ANALYSIS_DUMP_MODE:-tokens}
+export VERL_ROUTER_ANALYSIS_DUMP_EVERY_N=${VERL_ROUTER_ANALYSIS_DUMP_EVERY_N:-1}
+export VERL_ROUTER_ANALYSIS_DUMP_STEPS=${VERL_ROUTER_ANALYSIS_DUMP_STEPS:-0}
+export VERL_ROUTER_ANALYSIS_DUMP_SAMPLES=${VERL_ROUTER_ANALYSIS_DUMP_SAMPLES:-16}
+export VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE=${VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE:-float16}
+export VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS=${VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS:-32}
 GSM8K_DIR=${GSM8K_DIR:-"${RAY_DATA_HOME}/datasets/gsm8k"}
 DEEPSCALER_DIR=${DEEPSCALER_DIR:-"${RAY_DATA_HOME}/datasets/deepscaler"}
 TRAIN_FILE=${TRAIN_FILE:-"${DEEPSCALER_DIR}/train.parquet"}
@@ -162,7 +169,13 @@ TRAINING_CMD=(
     router.enable_mismatch_metrics=True
     router.enable_mismatch_rs=${enable_router_mismatch_rs}
     router.mismatch_rs_threshold=${router_mismatch_rs_threshold}
+    router.mismatch_rs_mode=${router_mismatch_rs_mode}
+    router.mismatch_rs_fraction=${router_mismatch_rs_fraction}
+    router.mismatch_rs_length_bucket_edges=${router_mismatch_rs_length_bucket_edges}
+    router.mismatch_metric_mode=${router_mismatch_metric_mode}
     router.mismatch_alignment_warmup_steps=${router_mismatch_alignment_warmup_steps}
+    router.expert_usage_smoothing_tau=${router_expert_usage_smoothing_tau}
+    router.expert_usage_num_experts=${router_expert_usage_num_experts}
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss}
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef}
     actor_rollout_ref.actor.kl_loss_type=${kl_loss_type}

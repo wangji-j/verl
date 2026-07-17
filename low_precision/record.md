@@ -1,5 +1,59 @@
 # Router Mismatch Sequence-RS Experiment Plan
 
+## 2026-07-02 实验总记录
+
+新增实验汇总文档：
+
+```text
+/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/verl-sequence/low_precision/experiment_analysis/experiment_summary.md
+```
+
+内容包含当前 FP8 rollout / Megatron GRPO / router mismatch / sequence RS / TIS / overlap_fraction / debug 实验的环境版本、公共设置、实验矩阵、主要现象、解释假设、后续建议和论文资料。
+
+## 2026-07-03 threshold0.25 + TIS-C2 resume200 dump 分析
+
+新增分析文档：
+
+```text
+/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/verl-sequence/low_precision/experiment_analysis/threshold0.25_TIS_resume200_analysis.md
+```
+
+对应聚合 JSON：
+
+```text
+/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/verl-sequence/low_precision/experiment_analysis/threshold0.25_TIS_resume200_dump_analysis.json
+```
+
+主要结论：`seq_mismatch > 0.25` 在 step201-244 阶段过滤比例约 7.0%，但 rejected response 更短且正确率更高，prompt group 层面更偏 easy group，不是过滤 hard/wrong response；极端 token 没有显示出明确的后续 mismatch 级联影响。
+
+## 2026-07-06 threshold0.25 + TIS-C2 resume200 dump 全量重算
+
+覆盖更新：
+
+```text
+/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/verl-sequence/low_precision/experiment_analysis/threshold0.25_TIS_resume200_analysis.md
+/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/verl-sequence/low_precision/experiment_analysis/threshold0.25_TIS_resume200_dump_analysis.json
+```
+
+本次基于 `router_analysis_dump_resume200` 当前全量 164 个 dump 文件重算，覆盖 step201-364，共 335872 条 response。主要结论：`threshold0.25 + TIS-C2` 后期 step301-364 仍有 length/correctness bias，rejected response 仍更短、accuracy/reward 更高；bias 相比早期减弱，但没有反转为优先过滤错误或困难 response。
+
+## 2026-07-05 overlap 0.045RS vs 0.04RS 对比分析
+
+新增分析文档：
+
+```text
+/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/verl-sequence/low_precision/experiment_analysis/overlap_0.045_vs_0.04_comparison.md
+```
+
+对应聚合 JSON：
+
+```text
+/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/verl-sequence/low_precision/experiment_analysis/overlap_threshold0.045RS_20260701_202845_analysis.json
+/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/verl-sequence/low_precision/experiment_analysis/overlap_threshold0.04RS_20260703_020122_analysis.json
+```
+
+主要结论：`0.04RS` 比 `0.045RS` 前期过滤更强，但没有阻止 train reward 上涨伴随 response length 下降的短答案化趋势；`0.04RS` 后期过滤比例暴涨并进入长输出/高截断/低 reward 状态。两组极端 token 均不是主要原因，val 先崩更像策略长度/格式/泛化偏移，train reward 是滞后信号。
+
 ## 实验目标
 
 当前实验面向 Qwen3-30B-A3B MoE 的 **FP8 rollout + BF16/Megatron training** 场景，核心问题是缓解 rollout 端推理路由和训练端 old log prob forward 路由不一致带来的训练不稳定。
@@ -660,3 +714,346 @@ NUMEXPR_NUM_THREADS=${DAPO_TASK_RUNNER_NUM_CPUS}
 ```
 
 目的：让 `router_mismatch_metrics` 这类在 DAPOTaskRunner/trainer 进程内执行的 CPU 大张量计算不再被 Ray actor 的 `num_cpus=1` 和单线程 CPU kernel 限制。
+
+### 2026-06-23: 在 DAPO trainer 的 extract_reward 路径增加 reward debug
+
+在 `dapo/dapo_ray_trainer.py` 中新增 `extract_reward` 后的本地 debug hook。
+
+原因：当前 DAPO 训练循环使用 `extract_reward(new_batch)` 直接从 `rm_scores` 取 reward，之前加在 `verl/workers/reward_manager/dapo.py` 的 debug 在这条快路径上不会触发。
+
+启用条件：
+
+```bash
+VERL_REWARD_DEBUG_DIR
+VERL_REWARD_DEBUG_STEPS
+VERL_REWARD_DEBUG_SAMPLES
+```
+
+输出文件：
+
+```text
+${VERL_REWARD_DEBUG_DIR}/extract_reward_debug_stepXXXX_pidYYYY.jsonl
+```
+
+每条记录包含 prompt、完整 response、response tail、ground truth、`rm_score`，以及使用当前 `default_compute_score` 对同一 response 重新解析得到的 `parser_score_debug`、`parser_acc_debug`、`parser_pred_debug` 和 `parser_error`。用途是定位训练前几步 reward 接近 `-1` 时，到底是答案格式不被 parser 接受、答案本身错误，还是数据源/ground truth 对不上。
+
+### 2026-06-24: math_dapo reward parser 兼容 boxed 与 Answer 格式
+
+改动文件：
+
+```bash
+verl/utils/reward_score/math_dapo.py
+```
+
+`compute_score` 的答案提取逻辑从只依赖 legacy `Answer:` 正则，改为：
+
+```text
+尾部 1000 字符内最后一个 \boxed{...} 优先
+若没有 boxed，再 fallback 到 Answer: xxx
+```
+
+返回结构保持不变：
+
+```python
+{"score": reward, "acc": acc, "pred": pred}
+```
+
+目的：对齐 DeepScaleR 训练 prompt 中的 `output the final within \boxed{}` 要求，同时保留对 `Answer:` 输出的兼容，避免 boxed 正确答案被解析成 `[INVALID]` 后打成 `-1`。
+
+### 2026-06-26: overlap mismatch RS 默认改为固定阈值 0.25
+
+改动文件：
+
+```bash
+low_precision/run_grpo_qwen3_moe_30b_megatron_fp8_rollout_overlap_top10rs_local.sh
+```
+
+默认 router mismatch RS 从 top 10% 过滤改为固定阈值过滤：
+
+```bash
+router_mismatch_rs_threshold=${ROUTER_MISMATCH_RS_THRESHOLD:-0.25}
+router_mismatch_rs_mode=${ROUTER_MISMATCH_RS_MODE:-threshold}
+router_mismatch_rs_fraction=${ROUTER_MISMATCH_RS_FRACTION:-0.0}
+```
+
+实验名默认后缀同步改为 `overlap-mismatch-threshold0.25RS-16K`，避免继续显示 `TOP10RS` 造成混淆。仍可通过环境变量覆盖阈值、模式和过滤比例。
+
+### 2026-06-26: router mismatch 训练过程分析数据 dump
+
+改动文件：
+
+```bash
+dapo/dapo_ray_trainer.py
+verl/utils/router_mismatch_metrics.py
+low_precision/run_grpo_qwen3_moe_30b_megatron_fp8_rollout_overlap_top10rs_local.sh
+```
+
+`RouterMismatchResult` 新增 `token_mismatch`，复用已计算的 token 级 mismatch，避免 dump 时重新比较专家集合。
+
+新增可控 dump 开关：
+
+```bash
+VERL_ROUTER_ANALYSIS_DUMP_DIR
+VERL_ROUTER_ANALYSIS_DUMP_MODE=summary|tokens|sample|full|off
+VERL_ROUTER_ANALYSIS_DUMP_EVERY_N
+VERL_ROUTER_ANALYSIS_DUMP_STEPS
+VERL_ROUTER_ANALYSIS_DUMP_SAMPLES
+VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE=float16|bfloat16|float32
+VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS
+```
+
+默认脚本配置为 `tokens` 模式，输出到：
+
+```text
+${CKPTS_DIR}/router_analysis_dump/router_analysis_stepXXXX_pidYYYY.pt
+```
+
+保存内容包括：
+
+- metadata：step、alignment、route shape/dtype、response token 数、metric 名称等；
+- response_summary：`seq_mismatch`、`seq_valid_token_count`、`seq_prob_diff`、`seq_logprob_diff`、`seq_reward`；
+- token_data：`responses`、`response_mask`、`attention_mask`、`token_mismatch`、`old_log_probs`、`rollout_log_probs`、`logprob_delta`、`logprob_diff`、`prob_diff`。
+- response_summary.extreme_tokens：每条 response 内 `token_mismatch` 最大的 topK token 位置、token id、`token_mismatch`、`old_log_probs`、`rollout_log_probs`、`prob_diff`、`logprob_diff`，用于定位序列内极端 mismatch token。
+- response_summary.extreme_prob_diff_tokens：每条 response 内 `prob_diff` 最大的 topK token 位置、token id、`prob_diff`、`logprob_diff`、`token_mismatch`、两侧 logprob，用于定位训推 sampled-token 概率差异最大的 token。
+
+`sample/full` 模式额外保存两侧 routed experts 原始张量；`sample` 仅保存前 `VERL_ROUTER_ANALYSIS_DUMP_SAMPLES` 条 response，`full` 保存全 batch，磁盘和耗时开销很大，默认不开。
+
+### 2026-07-02: Megatron torch_dist checkpoint 严格 resume 兼容补丁
+
+改动文件：
+
+```bash
+verl/utils/megatron/dist_checkpointing.py
+```
+
+问题：
+
+`global_step_200/actor/dist_ckpt/.metadata` 是 PyTorch DCP 原生 `Metadata`，包含 `storage_data/state_dict_metadata`，但没有 Megatron-Core 0.14 load 逻辑期望的 `mcore_data` 字段。严格 resume 时会在 `get_reformulation_metadata()` 中报：
+
+```text
+AttributeError: 'Metadata' object has no attribute 'mcore_data'
+```
+
+处理：
+
+在本地 verl 的 Megatron checkpoint load wrapper 里 monkey patch `megatron.core.dist_checkpointing.strategies.torch.get_reformulation_metadata`。当 checkpoint metadata 缺少 `mcore_data` 时，为 N-D flattened tensors 合成 identity reformulation metadata，让加载路径按当前 tensor formulation 读取。
+
+适用前提：
+
+- resume 时 Megatron 并行配置必须和保存 checkpoint 时一致，例如当前实验为 `TP=4, PP=1, EP=4, ETP=2`；
+- 不用于改变 TP/PP/EP/ETP 后的 resharding 加载。
+
+### 2026-07-07: expert usage distribution drift 指标与 top8 RS 脚本
+
+改动文件：
+
+```bash
+verl/utils/router_mismatch_metrics.py
+verl/trainer/ppo/ray_trainer.py
+verl/trainer/config/ppo_trainer.yaml
+low_precision/run_grpo_qwen3_moe_30b_megatron_fp8_rollout_usage_l1_top8rs_local.sh
+```
+
+新增 `router.mismatch_metric_mode=expert_usage_l1`：
+
+- 对每条 response、每个 MoE 层分别统计 rollout/train 两侧 top-k expert usage 分布；
+- 使用 Total Variation / L1 距离：
+
+```text
+D_{i,l} = 0.5 * sum_e |p_{i,l}(e) - q_{i,l}(e)|
+```
+
+- 序列级分数为所有 MoE 层平均；
+- `seq_mismatch` 使用短序列 shrinkage 后的 expert usage L1 分数，现有 `router.enable_mismatch_rs` 过滤逻辑可直接复用；
+- 脚本默认 `router.expert_usage_smoothing_tau=4096.0`，相当于约 512 个 token 的 top8 expert slots prior 强度；
+- 额外记录 raw/smoothed 全局指标、shrink factor、每层 smoothed/raw expert usage L1，方便后续比较不同距离和聚合方式。
+
+新增脚本：
+
+```bash
+low_precision/run_grpo_qwen3_30b_a3b_expert_distribution_l1_top8RS.sh
+```
+
+默认设置：
+
+```bash
+router.mismatch_metric_mode=expert_usage_l1
+router.mismatch_rs_mode=top_fraction
+router.mismatch_rs_fraction=0.08
+router.expert_usage_smoothing_tau=4096.0
+```
+
+`tau=4096` 是第一版保守默认值，依据：
+
+- 既有 `threshold0.25 + TIS-C2 resume200` dump 显示短回答存在明显 bias：`0-2048` 桶过滤率约 22.31%，`2048-4096` 桶约 18.00%，而 `8192-12288` 桶仅约 2.01%；
+- 同一分析中 `seq_mismatch vs length` 相关系数约 `-0.4466`，短序列更容易得到高 mismatch；
+- `TIS-C2 noRS` dump 也显示长度桶越短，`seq_mismatch_mean` 越高：`0-2048` 约 0.2408，`12288-16384` 约 0.2007；
+- 但 overlap+TIS dump 中 fixed threshold 过滤比例偏低：`0.045RS+TIS` 约 0.61%，`0.04RS+TIS` 约 3.25%。因此第一版不宜把 shrinkage 设置得太强，避免过度改变排序；
+- `tau=4096` 对应 top8 下约 512 token prior 强度：长度 512/1024/2048 token 的 shrink factor 分别约 0.500/0.667/0.800，长度 4096/8192 token 分别约 0.889/0.941。
+
+额外记录：
+
+```text
+expert_usage_l1_raw_p90
+expert_usage_l1_smoothing_delta_mean
+expert_usage_l1_shrink_factor_p10/p50/p90
+```
+
+用于后续消融 `tau=2048/4096/8192`、换距离函数、换聚合方式时判断 smoothing 对分数分布和排序的影响。
+
+### 2026-07-07: expert distribution L1 脚本 checkpoint 保留策略
+
+改动文件：
+
+```bash
+low_precision/run_grpo_qwen3_30b_a3b_expert_distribution_l1_top8RS.sh
+```
+
+默认 checkpoint 策略改为：
+
+```bash
+trainer.save_freq=30
+trainer.max_actor_ckpt_to_keep=1
+trainer.max_critic_ckpt_to_keep=1
+```
+
+含义：每 30 step 保存一次 checkpoint；保存新 checkpoint 后最多只保留最近 1 个 checkpoint，旧 checkpoint 会被 checkpoint manager 清理。当前 GRPO 无 critic，但同步设置 `max_critic_ckpt_to_keep=1`，避免未来脚本配置变化时保留策略不一致。
+
+### 2026-07-08: expert usage L1 长度分桶过滤脚本
+
+改动文件：
+
+```bash
+verl/trainer/ppo/ray_trainer.py
+verl/trainer/config/ppo_trainer.yaml
+low_precision/run_grpo_qwen3_30b_a3b_expert_distribution_l1_lengthbucket_top8RS_TIS.sh
+```
+
+新增 `router.mismatch_rs_mode=length_bucket_top_fraction`。过滤逻辑从全 batch 直接 top-k 改为按 response 有效长度分桶后，在每个桶内分别过滤最高 `router.mismatch_rs_fraction` 的 response。默认桶边界：
+
+```bash
+router.mismatch_rs_length_bucket_edges=[2048,4096,8192,12288]
+```
+
+新脚本默认配置：
+
+```bash
+EXPERIMENT_NAME_BASE=GRPO-DEEPSCALER-Qwen3-30B-A3B-base-MEGATRON-VLLM-FP8-usage-l1-lengthbucket-top8RS-TIS-C2-16K
+algorithm.rollout_correction.rollout_is=token
+algorithm.rollout_correction.rollout_is_threshold=2.0
+router.enable_mismatch_rs=True
+router.mismatch_rs_mode=length_bucket_top_fraction
+router.mismatch_rs_fraction=0.08
+router.mismatch_metric_mode=expert_usage_l1
+router.expert_usage_smoothing_tau=4096.0
+trainer.val_before_train=True
+trainer.save_freq=30
+trainer.max_actor_ckpt_to_keep=1
+trainer.max_critic_ckpt_to_keep=1
+```
+
+目的：修复全局 top8% 过滤中观察到的长度 bias。当前 dump 显示全局 top8% 主要过滤短且正确 response；长度分桶使短 response 只和短 response 比、长 response 只和长 response 比，避免分数与长度的系统性负相关直接转化为过滤偏置。
+
+额外记录的分桶指标：
+
+```text
+router/rollout_vs_train/rs_bucket_{i}_count
+router/rollout_vs_train/rs_bucket_{i}_rejected_count
+router/rollout_vs_train/rs_bucket_{i}_rejected_fraction
+router/rollout_vs_train/rs_bucket_{i}_threshold
+router/rollout_vs_train/rs_bucket_{i}_score_mean
+router/rollout_vs_train/rs_bucket_{i}_length_mean
+```
+
+### 2026-07-11: 长度桶 MAD z-score 全局 Top8% 与 prompt 保护
+
+改动文件：
+
+```bash
+verl/trainer/ppo/ray_trainer.py
+verl/trainer/config/ppo_trainer.yaml
+low_precision/run_grpo_qwen3_30b_a3b_expert_distribution_l1_madz_top8RS_TIS.sh
+```
+
+新增 `router.mismatch_rs_mode=length_bucket_mad_zscore_top_fraction`：先在每个 response
+长度桶内用 `median/MAD` 标准化 Expert Usage L1 分数，再对整个 batch 的 z-score 全局排序，
+默认过滤最高 8%。默认每个 prompt 最多过滤 2 条 response；配置了该限制但 batch 缺少 `uid`
+时会直接报错，避免静默退化为无 prompt 保护的过滤。
+
+默认配置：
+
+```bash
+algorithm.rollout_correction.rollout_is=token
+algorithm.rollout_correction.rollout_is_threshold=2.0
+router.mismatch_rs_mode=length_bucket_mad_zscore_top_fraction
+router.mismatch_rs_fraction=0.08
+router.mismatch_rs_max_reject_per_prompt=2
+router.mismatch_rs_mad_epsilon=1e-6
+router.mismatch_metric_mode=expert_usage_l1
+router.expert_usage_smoothing_tau=4096.0
+```
+
+新增记录包括各桶原始分数的 mean/median/MAD、z-score mean/max、实际过滤率、目标过滤数、
+因 prompt 上限跳过的候选数，以及过滤/保留 response 的平均长度、reward 均值和正 reward 比例。
+
+使用 `256 prompts x 8 responses` 的 CPU 合成 batch 验证：2048 条 response 过滤 164 条
+（`ceil(2048 * 0.08)`），每个 prompt 最多过滤 2 条。
+
+### 2026-07-14: 连续长度条件分位数 Top8% 过滤
+
+改动文件：
+
+```bash
+verl/utils/router_mismatch_metrics.py
+verl/trainer/ppo/ray_trainer.py
+verl/trainer/config/ppo_trainer.yaml
+tests/utils/test_router_mismatch_metrics_on_cpu.py
+low_precision/run_grpo_qwen3_30b_a3b_expert_distribution_l1_conditional_percentile_top8RS_TIS.sh
+```
+
+新增 `router.mismatch_rs_mode=length_conditional_percentile_top_fraction`。先按 response
+有效长度排序，每条 response 在长度相邻的滑动窗口中计算 Expert Usage L1 的经验百分位；
+同分采用 midpoint rank。达到最大生成长度的右截断 response 在数量足够时单独成组计算百分位。
+随后按条件百分位全局排序过滤，并复用已有的每个 prompt 最大过滤数量限制。
+
+默认配置：
+
+```bash
+algorithm.rollout_correction.rollout_is=token
+algorithm.rollout_correction.rollout_is_threshold=2.0
+router.mismatch_rs_mode=length_conditional_percentile_top_fraction
+router.mismatch_rs_fraction=0.08
+router.mismatch_rs_max_reject_per_prompt=2
+router.mismatch_rs_local_window=256
+router.mismatch_rs_censored_length=16384
+router.mismatch_rs_min_censored_count=32
+router.mismatch_metric_mode=expert_usage_l1
+router.expert_usage_smoothing_tau=4096.0
+```
+
+计算在 router score 所在设备上使用张量化的滑动窗口比较；默认 batch 2048、窗口 256，
+约 52 万次标量比较。新增记录包括条件百分位均值、过滤/保留条件百分位均值、右截断
+response 数、目标过滤数和因 prompt cap 跳过的候选数。原始 dump 已包含重算条件百分位所需的
+`seq_mismatch` 和 `seq_valid_token_count`，因此未重复保存每条 response 的条件百分位。
+
+CPU 测试覆盖 midpoint tie、右截断单独校准、无效 response，以及 trainer 端全局过滤和
+prompt cap。合成 batch 中 8 条 response 按 25% 过滤 2 条，且同一 prompt 最多过滤 1 条。
+## 2026-07-15 Expert distribution distance probe
+
+新增低开销专家分布距离观测实验：
+
+- 保持 `expert_usage_l1`（实际为平滑 TV）作为 Top8% RS 的真实过滤分数。
+- 在现有逐层专家计数循环中复用同一份直方图，同时记录 raw TV、L2、L-infinity、Hellinger squared、normalized JS 和 drift effective support。
+- 新增 `expert_counts` dump 模式，只在配置的 dump step 保存 rollout/train 两侧 `[response, layer, expert]` 紧凑计数和逐层距离，不保存完整 token/logprob 张量。
+- dump 同时保存实际 `rs_reject_mask`，并用过滤前的有效 response mask 计算长度和概率差，确保可以精确审计实际过滤集合。
+- 新测试脚本默认关闭训练前验证，运行 50 step，每 step dump 一次，每 5 step 保存 checkpoint。
+- 继承基础脚本的 `max_actor_ckpt_to_keep=1` 和 `max_critic_ckpt_to_keep=1`，成功保存新 checkpoint 后删除旧 checkpoint。
+- 默认开启 token-level TIS，截断阈值 `C=2`，不启用 verl 原生 rollout RS；Expert Usage TV Top8% RS 保持开启。
+
+脚本：
+
+```text
+low_precision/run_grpo_qwen3_30b_a3b_expert_distribution_distance_probe_top8RS.sh
+```
+
+该实验不更改训练使用的 RS 分数，目的是从相同 response 和相同专家计数离线比较不同距离的排序、长度偏差和训练风险相关性。

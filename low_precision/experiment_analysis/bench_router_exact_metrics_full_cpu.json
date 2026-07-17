@@ -1,0 +1,33 @@
+{
+  "config": {
+    "alignments": [
+      1
+    ],
+    "allocate_full": true,
+    "batch": 2048,
+    "chunk_tokens": 16,
+    "layers": 48,
+    "mode": "exact_metrics",
+    "num_experts": 256,
+    "rollout_dtype": "torch.int32",
+    "rollout_extra_tokens": 2048,
+    "threads": 180,
+    "tokens": 16384,
+    "topk": 8,
+    "train_dtype": "torch.uint8",
+    "valid_token_fraction": 0.38
+  },
+  "elapsed_s_mean": 46.836036048829556,
+  "results": [
+    {
+      "alignment_counts": {
+        "1": 1
+      },
+      "elapsed_s": 46.836036048829556,
+      "response_token_count_last_chunk": 12750848.0,
+      "response_token_match_rate": 0.0,
+      "seq_mismatch_max_last_chunk": 1.0,
+      "seq_mismatch_mean_last_chunk": 1.0
+    }
+  ]
+}

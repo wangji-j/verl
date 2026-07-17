@@ -90,9 +90,10 @@ RAY_ADDRESS=$RAY_ADDRESS ray job submit --runtime-env="${RUNTIME_ENV}" \
     trainer.test_freq="${test_freq}" \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.max_actor_ckpt_to_keep=1 \
+    trainer.max_critic_ckpt_to_keep=1 \
     trainer.total_epochs=1 \
     trainer.val_before_train=True \
-    trainer.save_freq=50 \
+    trainer.save_freq=20 \
     trainer.resume_mode=auto \
     trainer.nnodes="${NNODES_TRAIN}" \
     trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \

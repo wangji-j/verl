@@ -190,7 +190,8 @@ TRAINING_CMD=(
     trainer.resume_mode=auto
     trainer.log_val_generations=1
     trainer.total_training_steps=${total_training_steps}
-    trainer.max_actor_ckpt_to_keep=5
+    trainer.max_actor_ckpt_to_keep=1
+    trainer.max_critic_ckpt_to_keep=1
     actor_rollout_ref.rollout.enforce_eager=${rollout_enforce_eager}
     +ray_kwargs.ray_init.address=auto
 )

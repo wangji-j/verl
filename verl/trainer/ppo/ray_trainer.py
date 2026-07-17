@@ -67,7 +67,10 @@ from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
-from verl.utils.router_mismatch_metrics import compute_router_mismatch_metrics
+from verl.utils.router_mismatch_metrics import (
+    compute_length_conditional_percentiles,
+    compute_router_mismatch_metrics,
+)
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -1393,8 +1396,47 @@ class RayPPOTrainer:
     def _router_mismatch_rs_fraction(self) -> float:
         return float(OmegaConf.select(self.config, "router.mismatch_rs_fraction", default=0.1))
 
+    def _router_mismatch_rs_length_bucket_edges(self) -> list[int]:
+        value = OmegaConf.select(self.config, "router.mismatch_rs_length_bucket_edges", default=[2048, 4096, 8192, 12288])
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = value.strip().strip("[]")
+            raw_edges = [item.strip() for item in value.split(",") if item.strip()]
+        else:
+            raw_edges = list(value)
+        edges = sorted({int(edge) for edge in raw_edges if int(edge) > 0})
+        return edges
+
+    def _router_mismatch_rs_max_reject_per_prompt(self) -> int | None:
+        value = OmegaConf.select(self.config, "router.mismatch_rs_max_reject_per_prompt", default=None)
+        if value is None:
+            return None
+        value = int(value)
+        return value if value >= 0 else None
+
+    def _router_mismatch_rs_mad_epsilon(self) -> float:
+        return float(OmegaConf.select(self.config, "router.mismatch_rs_mad_epsilon", default=1e-6))
+
+    def _router_mismatch_rs_local_window(self) -> int:
+        return int(OmegaConf.select(self.config, "router.mismatch_rs_local_window", default=256))
+
+    def _router_mismatch_rs_censored_length(self) -> int | None:
+        value = OmegaConf.select(self.config, "router.mismatch_rs_censored_length", default=None)
+        return None if value is None else int(value)
+
+    def _router_mismatch_rs_min_censored_count(self) -> int:
+        return int(OmegaConf.select(self.config, "router.mismatch_rs_min_censored_count", default=32))
+
     def _router_mismatch_metric_mode(self) -> str:
         return str(OmegaConf.select(self.config, "router.mismatch_metric_mode", default="exact_set"))
+
+    def _router_expert_usage_smoothing_tau(self) -> float:
+        return float(OmegaConf.select(self.config, "router.expert_usage_smoothing_tau", default=4096.0))
+
+    def _router_expert_usage_num_experts(self) -> int | None:
+        value = OmegaConf.select(self.config, "router.expert_usage_num_experts", default=None)
+        return None if value is None else int(value)
 
     def _router_mismatch_alignment_warmup_steps(self) -> int:
         return int(OmegaConf.select(self.config, "router.mismatch_alignment_warmup_steps", default=3))
@@ -1422,6 +1464,10 @@ class RayPPOTrainer:
             if self._router_mismatch_frozen_alignment is not None
             else (0, -1, 1)
         )
+        dump_mode = os.getenv("VERL_ROUTER_ANALYSIS_DUMP_MODE", "summary").strip().lower()
+        should_capture_counts = False
+        if dump_mode == "expert_counts" and hasattr(self, "_should_dump_router_analysis"):
+            should_capture_counts = bool(self._should_dump_router_analysis(int(getattr(self, "global_steps", -1))))
         result = compute_router_mismatch_metrics(
             rollout_routes,
             train_routes,
@@ -1429,6 +1475,9 @@ class RayPPOTrainer:
             metric_prefix="router/rollout_vs_train",
             alignments=alignments,
             metric_mode=self._router_mismatch_metric_mode(),
+            expert_usage_smoothing_tau=self._router_expert_usage_smoothing_tau(),
+            expert_usage_num_experts=self._router_expert_usage_num_experts(),
+            capture_expert_usage_counts=should_capture_counts,
         )
         debug_after = self._cuda_memory_snapshot(debug_device)
         self._write_perf_debug(
@@ -1498,6 +1547,7 @@ class RayPPOTrainer:
         mode = self._router_mismatch_rs_mode()
         threshold = self._router_mismatch_rs_threshold()
         fraction = self._router_mismatch_rs_fraction()
+        bucket_metrics: dict[str, float] = {}
 
         if mode == "threshold":
             reject = valid_seq & (seq_mismatch > threshold)
@@ -1514,14 +1564,268 @@ class RayPPOTrainer:
                 effective_threshold = float(topk_values.min().item())
             else:
                 effective_threshold = 0.0
+        elif mode == "length_bucket_top_fraction":
+            reject = torch.zeros_like(valid_seq, dtype=torch.bool)
+            effective_threshold = 0.0
+            bucket_edges = self._router_mismatch_rs_length_bucket_edges()
+            bucket_lowers = [0] + bucket_edges
+            bucket_uppers = bucket_edges + [None]
+            thresholds = []
+            for bucket_idx, (lower, upper) in enumerate(zip(bucket_lowers, bucket_uppers, strict=True)):
+                in_bucket = valid_seq & (seq_valid_token_count >= float(lower))
+                if upper is not None:
+                    in_bucket = in_bucket & (seq_valid_token_count < float(upper))
+                bucket_indices = torch.nonzero(in_bucket, as_tuple=False).flatten()
+                bucket_count = int(bucket_indices.numel())
+                bucket_reject_count = 0
+                bucket_threshold = 0.0
+                if fraction > 0 and bucket_count > 0:
+                    k = min(max(math.ceil(bucket_count * fraction), 1), bucket_count)
+                    bucket_scores = seq_mismatch[bucket_indices]
+                    topk_values, topk_pos = torch.topk(bucket_scores, k=k, largest=True, sorted=False)
+                    reject[bucket_indices[topk_pos]] = True
+                    bucket_reject_count = int(k)
+                    bucket_threshold = float(topk_values.min().item())
+                    thresholds.append(bucket_threshold)
+                if bucket_count > 0:
+                    bucket_scores_all = seq_mismatch[bucket_indices]
+                    bucket_lengths_all = seq_valid_token_count[bucket_indices]
+                    prefix = f"router/rollout_vs_train/rs_bucket_{bucket_idx}"
+                    bucket_metrics[f"{prefix}_lower"] = float(lower)
+                    bucket_metrics[f"{prefix}_upper"] = float(upper) if upper is not None else -1.0
+                    bucket_metrics[f"{prefix}_count"] = float(bucket_count)
+                    bucket_metrics[f"{prefix}_rejected_count"] = float(bucket_reject_count)
+                    bucket_metrics[f"{prefix}_rejected_fraction"] = float(bucket_reject_count / bucket_count)
+                    bucket_metrics[f"{prefix}_threshold"] = float(bucket_threshold)
+                    bucket_metrics[f"{prefix}_score_mean"] = float(bucket_scores_all.float().mean().item())
+                    bucket_metrics[f"{prefix}_length_mean"] = float(bucket_lengths_all.float().mean().item())
+            if thresholds:
+                effective_threshold = min(thresholds)
+        elif mode == "length_bucket_mad_zscore_top_fraction":
+            reject = torch.zeros_like(valid_seq, dtype=torch.bool)
+            z_scores = torch.full_like(seq_mismatch, float("-inf"), dtype=torch.float32)
+            bucket_ids = torch.full_like(seq_valid_token_count, -1, dtype=torch.long)
+            bucket_edges = self._router_mismatch_rs_length_bucket_edges()
+            bucket_lowers = [0] + bucket_edges
+            bucket_uppers = bucket_edges + [None]
+            mad_epsilon = max(self._router_mismatch_rs_mad_epsilon(), torch.finfo(torch.float32).eps)
+
+            for bucket_idx, (lower, upper) in enumerate(zip(bucket_lowers, bucket_uppers, strict=True)):
+                in_bucket = valid_seq & (seq_valid_token_count >= float(lower))
+                if upper is not None:
+                    in_bucket = in_bucket & (seq_valid_token_count < float(upper))
+                bucket_indices = torch.nonzero(in_bucket, as_tuple=False).flatten()
+                bucket_count = int(bucket_indices.numel())
+                if bucket_count == 0:
+                    continue
+
+                bucket_scores = seq_mismatch[bucket_indices].float()
+                median = bucket_scores.median()
+                mad = (bucket_scores - median).abs().median()
+                scale = torch.clamp(mad, min=mad_epsilon)
+                bucket_z = (bucket_scores - median) / scale
+                z_scores[bucket_indices] = bucket_z
+                bucket_ids[bucket_indices] = bucket_idx
+
+                prefix = f"router/rollout_vs_train/rs_bucket_{bucket_idx}"
+                bucket_metrics[f"{prefix}_lower"] = float(lower)
+                bucket_metrics[f"{prefix}_upper"] = float(upper) if upper is not None else -1.0
+                bucket_metrics[f"{prefix}_count"] = float(bucket_count)
+                bucket_metrics[f"{prefix}_score_mean"] = float(bucket_scores.mean().item())
+                bucket_metrics[f"{prefix}_score_median"] = float(median.item())
+                bucket_metrics[f"{prefix}_score_mad"] = float(mad.item())
+                bucket_metrics[f"{prefix}_z_mean"] = float(bucket_z.mean().item())
+                bucket_metrics[f"{prefix}_z_max"] = float(bucket_z.max().item())
+                bucket_metrics[f"{prefix}_length_mean"] = float(
+                    seq_valid_token_count[bucket_indices].float().mean().item()
+                )
+
+            valid_indices = torch.nonzero(valid_seq, as_tuple=False).flatten()
+            target_rejected_count = 0
+            skipped_by_prompt_cap = 0
+            max_per_prompt = self._router_mismatch_rs_max_reject_per_prompt()
+            uids = batch.non_tensor_batch.get("uid") if hasattr(batch, "non_tensor_batch") else None
+            can_apply_prompt_cap = (
+                max_per_prompt is not None and uids is not None and len(uids) == int(reject.numel())
+            )
+            if max_per_prompt is not None and not can_apply_prompt_cap:
+                raise RuntimeError(
+                    "length_bucket_mad_zscore_top_fraction requires one uid per response when "
+                    "router.mismatch_rs_max_reject_per_prompt is configured."
+                )
+            if fraction > 0 and int(valid_indices.numel()) > 0:
+                target_rejected_count = min(
+                    max(math.ceil(int(valid_indices.numel()) * fraction), 1), int(valid_indices.numel())
+                )
+                sorted_pos = torch.argsort(z_scores[valid_indices], descending=True)
+                sorted_indices = valid_indices[sorted_pos].detach().cpu().tolist()
+                rejected_per_prompt: dict[object, int] = {}
+                selected_indices: list[int] = []
+                for sample_idx in sorted_indices:
+                    if len(selected_indices) >= target_rejected_count:
+                        break
+                    if can_apply_prompt_cap:
+                        uid = uids[sample_idx]
+                        uid_key = uid.item() if hasattr(uid, "item") else uid
+                        try:
+                            hash(uid_key)
+                        except TypeError:
+                            uid_key = str(uid_key)
+                        if rejected_per_prompt.get(uid_key, 0) >= max_per_prompt:
+                            skipped_by_prompt_cap += 1
+                            continue
+                        rejected_per_prompt[uid_key] = rejected_per_prompt.get(uid_key, 0) + 1
+                    selected_indices.append(sample_idx)
+                if selected_indices:
+                    selected_tensor = torch.tensor(selected_indices, device=reject.device, dtype=torch.long)
+                    reject[selected_tensor] = True
+                    effective_threshold = float(z_scores[selected_tensor].min().item())
+                else:
+                    effective_threshold = 0.0
+            else:
+                effective_threshold = 0.0
+
+            for bucket_idx in range(len(bucket_lowers)):
+                in_bucket = valid_seq & (bucket_ids == bucket_idx)
+                bucket_count = int(in_bucket.sum().item())
+                bucket_rejected_count = int((reject & in_bucket).sum().item())
+                if bucket_count > 0:
+                    prefix = f"router/rollout_vs_train/rs_bucket_{bucket_idx}"
+                    bucket_metrics[f"{prefix}_rejected_count"] = float(bucket_rejected_count)
+                    bucket_metrics[f"{prefix}_rejected_fraction"] = float(bucket_rejected_count / bucket_count)
+                    if bucket_rejected_count > 0:
+                        rejected_in_bucket = reject & in_bucket
+                        bucket_metrics[f"{prefix}_rejected_score_mean"] = float(
+                            seq_mismatch[rejected_in_bucket].float().mean().item()
+                        )
+                        bucket_metrics[f"{prefix}_rejected_z_mean"] = float(
+                            z_scores[rejected_in_bucket].mean().item()
+                        )
+                        bucket_metrics[f"{prefix}_rejected_length_mean"] = float(
+                            seq_valid_token_count[rejected_in_bucket].float().mean().item()
+                        )
+                    bucket_kept_count = bucket_count - bucket_rejected_count
+                    if bucket_kept_count > 0:
+                        kept_in_bucket = in_bucket & ~reject
+                        bucket_metrics[f"{prefix}_kept_score_mean"] = float(
+                            seq_mismatch[kept_in_bucket].float().mean().item()
+                        )
+                        bucket_metrics[f"{prefix}_kept_z_mean"] = float(z_scores[kept_in_bucket].mean().item())
+                        bucket_metrics[f"{prefix}_kept_length_mean"] = float(
+                            seq_valid_token_count[kept_in_bucket].float().mean().item()
+                        )
+            bucket_metrics["router/rollout_vs_train/rs_target_rejected_count"] = float(target_rejected_count)
+            bucket_metrics["router/rollout_vs_train/rs_prompt_cap_skipped_count"] = float(skipped_by_prompt_cap)
+            bucket_metrics["router/rollout_vs_train/rs_mad_epsilon"] = float(mad_epsilon)
+            if bool(valid_seq.any().item()):
+                bucket_metrics["router/rollout_vs_train/rs_z_mean"] = float(z_scores[valid_seq].mean().item())
+            if bool(reject.any().item()):
+                bucket_metrics["router/rollout_vs_train/rs_rejected_z_mean"] = float(z_scores[reject].mean().item())
+            kept_for_z = valid_seq & ~reject
+            if bool(kept_for_z.any().item()):
+                bucket_metrics["router/rollout_vs_train/rs_kept_z_mean"] = float(
+                    z_scores[kept_for_z].mean().item()
+                )
+        elif mode == "length_conditional_percentile_top_fraction":
+            local_window = self._router_mismatch_rs_local_window()
+            censored_length = self._router_mismatch_rs_censored_length()
+            min_censored_count = self._router_mismatch_rs_min_censored_count()
+            percentile_scores = compute_length_conditional_percentiles(
+                seq_mismatch,
+                seq_valid_token_count,
+                local_window=local_window,
+                censored_length=censored_length,
+                min_censored_count=min_censored_count,
+            )
+            reject = torch.zeros_like(valid_seq, dtype=torch.bool)
+            valid_indices = torch.nonzero(valid_seq, as_tuple=False).flatten()
+            target_rejected_count = 0
+            skipped_by_prompt_cap = 0
+            max_per_prompt = self._router_mismatch_rs_max_reject_per_prompt()
+            uids = batch.non_tensor_batch.get("uid") if hasattr(batch, "non_tensor_batch") else None
+            can_apply_prompt_cap = (
+                max_per_prompt is not None and uids is not None and len(uids) == int(reject.numel())
+            )
+            if max_per_prompt is not None and not can_apply_prompt_cap:
+                raise RuntimeError(
+                    "length_conditional_percentile_top_fraction requires one uid per response when "
+                    "router.mismatch_rs_max_reject_per_prompt is configured."
+                )
+            if fraction > 0 and int(valid_indices.numel()) > 0:
+                target_rejected_count = min(
+                    max(math.ceil(int(valid_indices.numel()) * fraction), 1), int(valid_indices.numel())
+                )
+                sorted_pos = torch.argsort(
+                    percentile_scores[valid_indices], descending=True, stable=True
+                )
+                sorted_indices = valid_indices[sorted_pos].detach().cpu().tolist()
+                rejected_per_prompt: dict[object, int] = {}
+                selected_indices: list[int] = []
+                for sample_idx in sorted_indices:
+                    if len(selected_indices) >= target_rejected_count:
+                        break
+                    if can_apply_prompt_cap:
+                        uid = uids[sample_idx]
+                        uid_key = uid.item() if hasattr(uid, "item") else uid
+                        try:
+                            hash(uid_key)
+                        except TypeError:
+                            uid_key = str(uid_key)
+                        if rejected_per_prompt.get(uid_key, 0) >= max_per_prompt:
+                            skipped_by_prompt_cap += 1
+                            continue
+                        rejected_per_prompt[uid_key] = rejected_per_prompt.get(uid_key, 0) + 1
+                    selected_indices.append(sample_idx)
+                if selected_indices:
+                    selected_tensor = torch.tensor(selected_indices, device=reject.device, dtype=torch.long)
+                    reject[selected_tensor] = True
+                    effective_threshold = float(percentile_scores[selected_tensor].min().item())
+                else:
+                    effective_threshold = 0.0
+            else:
+                effective_threshold = 0.0
+
+            valid_percentiles = percentile_scores[valid_seq]
+            censored_count = 0
+            if censored_length is not None:
+                censored_count = int((valid_seq & (seq_valid_token_count >= censored_length)).sum().item())
+            bucket_metrics.update(
+                {
+                    "router/rollout_vs_train/rs_conditional_percentile_top_fraction": fraction,
+                    "router/rollout_vs_train/rs_conditional_percentile_local_window": float(local_window),
+                    "router/rollout_vs_train/rs_conditional_percentile_mean": float(
+                        valid_percentiles.mean().item()
+                    ),
+                    "router/rollout_vs_train/rs_conditional_percentile_censored_length": float(
+                        censored_length if censored_length is not None else -1
+                    ),
+                    "router/rollout_vs_train/rs_conditional_percentile_censored_count": float(
+                        censored_count
+                    ),
+                    "router/rollout_vs_train/rs_target_rejected_count": float(target_rejected_count),
+                    "router/rollout_vs_train/rs_prompt_cap_skipped_count": float(skipped_by_prompt_cap),
+                }
+            )
+            if bool(reject.any().item()):
+                bucket_metrics["router/rollout_vs_train/rs_rejected_conditional_percentile_mean"] = float(
+                    percentile_scores[reject].mean().item()
+                )
+            kept_for_percentile = valid_seq & ~reject
+            if bool(kept_for_percentile.any().item()):
+                bucket_metrics["router/rollout_vs_train/rs_kept_conditional_percentile_mean"] = float(
+                    percentile_scores[kept_for_percentile].mean().item()
+                )
         else:
             raise ValueError(
-                "router.mismatch_rs_mode must be 'threshold' or 'top_fraction', "
+                "router.mismatch_rs_mode must be 'threshold', 'top_fraction', 'length_bucket_top_fraction', "
+                "'length_bucket_mad_zscore_top_fraction', or "
+                "'length_conditional_percentile_top_fraction', "
                 f"got {mode!r}"
             )
 
         response_mask = batch.batch["response_mask"]
         reject = reject.to(device=response_mask.device)
+        batch.batch["router_mismatch_reject_mask"] = reject
         if bool(reject.any().item()):
             response_mask[reject] = 0
 
@@ -1533,10 +1837,51 @@ class RayPPOTrainer:
             "router/rollout_vs_train/rs_threshold": effective_threshold,
             "router/rollout_vs_train/rs_config_threshold": threshold,
             "router/rollout_vs_train/rs_top_fraction": fraction if mode == "top_fraction" else 0.0,
+            "router/rollout_vs_train/rs_length_bucket_top_fraction": fraction
+            if mode == "length_bucket_top_fraction"
+            else 0.0,
+            "router/rollout_vs_train/rs_mad_zscore_top_fraction": fraction
+            if mode == "length_bucket_mad_zscore_top_fraction"
+            else 0.0,
+            "router/rollout_vs_train/rs_conditional_percentile_top_fraction": fraction
+            if mode == "length_conditional_percentile_top_fraction"
+            else 0.0,
             "router/rollout_vs_train/rs_rejected_fraction": rejected_fraction,
             "router/rollout_vs_train/rs_rejected_count": float(rejected_count),
             "router/rollout_vs_train/rs_kept_count": float(kept_count),
         }
+        if valid_count > 0:
+            valid_lengths = seq_valid_token_count[valid_seq].float()
+            metrics["router/rollout_vs_train/rs_length_before_mean"] = float(valid_lengths.mean().item())
+            if rejected_count > 0:
+                metrics["router/rollout_vs_train/rs_rejected_length_mean"] = float(
+                    seq_valid_token_count[reject].float().mean().item()
+                )
+            if kept_count > 0:
+                metrics["router/rollout_vs_train/rs_kept_length_mean"] = float(
+                    seq_valid_token_count[valid_seq & ~reject].float().mean().item()
+                )
+            token_level_scores = batch.batch.get("token_level_scores")
+            if token_level_scores is not None and token_level_scores.shape[0] == reject.numel():
+                sequence_scores = token_level_scores.float().sum(dim=-1)
+                metrics["router/rollout_vs_train/rs_score_before_mean"] = float(
+                    sequence_scores[valid_seq].mean().item()
+                )
+                if rejected_count > 0:
+                    rejected_scores = sequence_scores[reject]
+                    metrics["router/rollout_vs_train/rs_rejected_score_mean"] = float(
+                        rejected_scores.mean().item()
+                    )
+                    metrics["router/rollout_vs_train/rs_rejected_positive_fraction"] = float(
+                        (rejected_scores > 0).float().mean().item()
+                    )
+                if kept_count > 0:
+                    kept_scores = sequence_scores[valid_seq & ~reject]
+                    metrics["router/rollout_vs_train/rs_kept_score_mean"] = float(kept_scores.mean().item())
+                    metrics["router/rollout_vs_train/rs_kept_positive_fraction"] = float(
+                        (kept_scores > 0).float().mean().item()
+                    )
+        metrics.update(bucket_metrics)
 
         uids = batch.non_tensor_batch.get("uid") if hasattr(batch, "non_tensor_batch") else None
         if uids is not None and len(uids) == int(reject.numel()):

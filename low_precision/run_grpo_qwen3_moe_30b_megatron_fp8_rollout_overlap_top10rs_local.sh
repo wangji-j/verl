@@ -8,13 +8,13 @@ export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
-export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
+# WANDB_API_KEY is read from the environment or an existing W&B login.
 export WANDB_MODE=${WANDB_MODE:-online}
 export NVTE_FP8_BLOCK_SCALING_FP32_SCALES=${NVTE_FP8_BLOCK_SCALING_FP32_SCALES:-1}
 
 run_timestamp=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
 project_name=${PROJECT_NAME:-jly-DAPO-DEEPSCALER-FP8-ROLLOUT}
-exp_name_base=${EXPERIMENT_NAME_BASE:-GRPO-DEEPSCALER-Qwen3-30B-A3B-base-MEGATRON-VLLM-FP8-overlap-mismatch-TOP10RS-16K}
+exp_name_base=${EXPERIMENT_NAME_BASE:-GRPO-DEEPSCALER-Qwen3-30B-A3B-base-MEGATRON-VLLM-FP8-overlap-mismatch-threshold0.045RS-16K}
 exp_name=${EXPERIMENT_NAME:-${exp_name_base}_${run_timestamp}}
 trainer_logger=${TRAINER_LOGGER:-'["console","tensorboard","wandb"]'}
 
@@ -37,9 +37,9 @@ rollout_rs_threshold=null
 
 enable_rollout_routing_replay=${ENABLE_ROLLOUT_ROUTING_REPLAY:-False}
 enable_router_mismatch_rs=${ENABLE_ROUTER_MISMATCH_RS:-True}
-router_mismatch_rs_threshold=${ROUTER_MISMATCH_RS_THRESHOLD:-0.3}
-router_mismatch_rs_mode=${ROUTER_MISMATCH_RS_MODE:-top_fraction}
-router_mismatch_rs_fraction=${ROUTER_MISMATCH_RS_FRACTION:-0.1}
+router_mismatch_rs_threshold=${ROUTER_MISMATCH_RS_THRESHOLD:-0.045}
+router_mismatch_rs_mode=${ROUTER_MISMATCH_RS_MODE:-threshold}
+router_mismatch_rs_fraction=${ROUTER_MISMATCH_RS_FRACTION:-0.0}
 router_mismatch_metric_mode=${ROUTER_MISMATCH_METRIC_MODE:-overlap_fraction}
 router_mismatch_alignment_warmup_steps=${ROUTER_MISMATCH_ALIGNMENT_WARMUP_STEPS:-1}
 
@@ -69,6 +69,13 @@ export VERL_REWARD_DEBUG_DIR=${VERL_REWARD_DEBUG_DIR:-"${CKPTS_DIR}/reward_debug
 export VERL_REWARD_DEBUG_STEPS=${VERL_REWARD_DEBUG_STEPS:-40}
 export VERL_REWARD_DEBUG_SAMPLES=${VERL_REWARD_DEBUG_SAMPLES:-16}
 export VERL_PERF_DEBUG_DIR=${VERL_PERF_DEBUG_DIR:-"${CKPTS_DIR}/perf_debug"}
+export VERL_ROUTER_ANALYSIS_DUMP_DIR=${VERL_ROUTER_ANALYSIS_DUMP_DIR:-"${CKPTS_DIR}/router_analysis_dump"}
+export VERL_ROUTER_ANALYSIS_DUMP_MODE=${VERL_ROUTER_ANALYSIS_DUMP_MODE:-tokens}
+export VERL_ROUTER_ANALYSIS_DUMP_EVERY_N=${VERL_ROUTER_ANALYSIS_DUMP_EVERY_N:-1}
+export VERL_ROUTER_ANALYSIS_DUMP_STEPS=${VERL_ROUTER_ANALYSIS_DUMP_STEPS:-0}
+export VERL_ROUTER_ANALYSIS_DUMP_SAMPLES=${VERL_ROUTER_ANALYSIS_DUMP_SAMPLES:-16}
+export VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE=${VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE:-float16}
+export VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS=${VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS:-32}
 GSM8K_DIR=${GSM8K_DIR:-"${RAY_DATA_HOME}/datasets/gsm8k"}
 DEEPSCALER_DIR=${DEEPSCALER_DIR:-"${RAY_DATA_HOME}/datasets/deepscaler"}
 TRAIN_FILE=${TRAIN_FILE:-"${DEEPSCALER_DIR}/train.parquet"}
@@ -110,7 +117,7 @@ rollout_compilation_mode=${ROLLOUT_COMPILATION_MODE:-NONE}
 rollout_cudagraph_mode=${ROLLOUT_CUDAGRAPH_MODE:-NONE}
 val_before_train=${VAL_BEFORE_TRAIN:-True}
 test_freq=${TEST_FREQ:-10}
-save_freq=${SAVE_FREQ:-50}
+save_freq=${SAVE_FREQ:-20}
 total_training_steps=${TOTAL_TRAINING_STEPS:-500}
 
 export PYTHONPATH="${WORKING_DIR}:${RECIPE_DIR}:${PYTHONPATH:-}"
@@ -242,11 +249,13 @@ TRAINING_CMD=(
     trainer.test_freq=${test_freq}
     trainer.save_freq=${save_freq}
     trainer.total_epochs=100
+    +trainer.log_epoch_number=True
     trainer.default_local_dir="${CKPTS_DIR}"
     trainer.resume_mode=auto
     trainer.log_val_generations=1
     trainer.total_training_steps=${total_training_steps}
-    trainer.max_actor_ckpt_to_keep=5
+    trainer.max_actor_ckpt_to_keep=1
+    trainer.max_critic_ckpt_to_keep=1
     +trainer.use_legacy_worker_impl=disable
     actor_rollout_ref.rollout.enforce_eager=${rollout_enforce_eager}
     +ray_kwargs.ray_init.address=auto

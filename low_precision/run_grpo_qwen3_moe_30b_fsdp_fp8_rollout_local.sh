@@ -8,7 +8,7 @@ export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
-export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
+# WANDB_API_KEY is read from the environment or an existing W&B login.
 export WANDB_MODE=${WANDB_MODE:-online}
 
 run_timestamp=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
@@ -89,7 +89,7 @@ rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-128}
 rollout_enforce_eager=${ROLLOUT_ENFORCE_EAGER:-False}
 val_before_train=${VAL_BEFORE_TRAIN:-True}
 test_freq=${TEST_FREQ:-10}
-save_freq=${SAVE_FREQ:-50}
+save_freq=${SAVE_FREQ:-20}
 total_training_steps=${TOTAL_TRAINING_STEPS:-500}
 
 export PYTHONPATH="${RECIPE_DIR}:${WORKING_DIR}:${PYTHONPATH:-}"
@@ -189,11 +189,13 @@ TRAINING_CMD=(
     trainer.test_freq=${test_freq}
     trainer.save_freq=${save_freq}
     trainer.total_epochs=100
+    +trainer.log_epoch_number=True
     trainer.default_local_dir="${CKPTS_DIR}"
     trainer.resume_mode=auto
     trainer.log_val_generations=1
     trainer.total_training_steps=${total_training_steps}
-    trainer.max_actor_ckpt_to_keep=5
+    trainer.max_actor_ckpt_to_keep=1
+    trainer.max_critic_ckpt_to_keep=1
     actor_rollout_ref.rollout.enforce_eager=${rollout_enforce_eager}
     +ray_kwargs.ray_init.address=auto
 )

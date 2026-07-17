@@ -16,6 +16,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import json
 import os
 import time
 import uuid
@@ -41,6 +42,7 @@ from verl.trainer.ppo.reward import extract_reward
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
+from verl.utils.reward_score import default_compute_score
 from verl.utils.rollout_skip import RolloutSkip
 
 
@@ -48,6 +50,382 @@ class RayDAPOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+
+    def _reward_extract_debug_enabled(self) -> bool:
+        return bool(os.getenv("VERL_REWARD_DEBUG_DIR", "").strip())
+
+    def _maybe_log_extract_reward_debug(
+        self, batch: DataProto, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict
+    ) -> None:
+        debug_dir = os.getenv("VERL_REWARD_DEBUG_DIR", "").strip()
+        if not debug_dir:
+            return
+
+        debug_steps = int(os.getenv("VERL_REWARD_DEBUG_STEPS", "0") or 0)
+        debug_samples = int(os.getenv("VERL_REWARD_DEBUG_SAMPLES", "8") or 0)
+        if debug_steps <= 0 or debug_samples <= 0:
+            return
+
+        global_step = int(batch.meta_info.get("global_steps", self.global_steps)) if batch.meta_info else self.global_steps
+        if global_step < 0 or global_step >= debug_steps:
+            return
+
+        rows = []
+        num_samples = min(len(batch), debug_samples)
+        reward_extra_keys = list(reward_extra_infos_dict.keys()) if reward_extra_infos_dict else []
+
+        for i in range(num_samples):
+            data_item = batch[i]
+            prompt_ids = data_item.batch["prompts"]
+            response_ids = data_item.batch["responses"]
+            prompt_length = prompt_ids.shape[-1]
+
+            valid_prompt_length = int(data_item.batch["attention_mask"][:prompt_length].sum().item())
+            valid_response_length = int(data_item.batch["attention_mask"][prompt_length:].sum().item())
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:] if valid_prompt_length > 0 else prompt_ids[:0]
+            valid_response_ids = response_ids[:valid_response_length]
+
+            prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            eos_token = self.tokenizer.eos_token
+            if eos_token and response_str.endswith(eos_token):
+                response_str = response_str[: -len(eos_token)]
+
+            reward_model = data_item.non_tensor_batch.get("reward_model", {})
+            ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
+            data_source = data_item.non_tensor_batch.get("data_source", "unknown")
+            extra_info = data_item.non_tensor_batch.get("extra_info", {})
+            rm_score = float(reward_tensor[i].sum().item())
+
+            parser_result = None
+            parser_error = None
+            if ground_truth is not None:
+                try:
+                    parser_result = default_compute_score(
+                        data_source=data_source,
+                        solution_str=response_str,
+                        ground_truth=ground_truth,
+                        extra_info=extra_info,
+                    )
+                except Exception as exc:  # debug path must not affect training
+                    parser_error = repr(exc)
+
+            if isinstance(parser_result, dict):
+                parser_score = parser_result.get("score")
+                parser_acc = parser_result.get("acc")
+                parser_pred = parser_result.get("pred")
+            else:
+                parser_score = parser_result
+                parser_acc = parser_result
+                parser_pred = None
+
+            reward_extra = {}
+            for key in reward_extra_keys:
+                values = reward_extra_infos_dict.get(key, [])
+                if i < len(values):
+                    value = values[i]
+                    if isinstance(value, np.generic):
+                        value = value.item()
+                    reward_extra[key] = value
+
+            rows.append(
+                {
+                    "global_step": global_step,
+                    "sample_index": i,
+                    "uid": str(data_item.non_tensor_batch.get("uid", "")),
+                    "data_source": str(data_source),
+                    "ground_truth": ground_truth,
+                    "rm_score": rm_score,
+                    "parser_score_debug": parser_score,
+                    "parser_acc_debug": bool(parser_acc) if isinstance(parser_acc, (bool, np.bool_)) else parser_acc,
+                    "parser_pred_debug": parser_pred,
+                    "parser_error": parser_error,
+                    "reward_extra": reward_extra,
+                    "prompt": prompt_str,
+                    "response": response_str,
+                    "response_head_1000": response_str[:1000],
+                    "response_tail_1000": response_str[-1000:],
+                    "response_length": valid_response_length,
+                    "has_answer_prefix": "answer:" in response_str.lower()[-1000:],
+                    "has_boxed": "\\boxed" in response_str[-1000:],
+                }
+            )
+
+        if not rows:
+            return
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(debug_dir, f"extract_reward_debug_step{global_step:04d}_pid{os.getpid()}.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+
+    def _router_analysis_dump_dir(self) -> str:
+        return os.getenv("VERL_ROUTER_ANALYSIS_DUMP_DIR", "").strip()
+
+    def _router_analysis_dump_mode(self) -> str:
+        return os.getenv("VERL_ROUTER_ANALYSIS_DUMP_MODE", "summary").strip().lower()
+
+    def _router_analysis_dump_float_dtype(self) -> torch.dtype:
+        dtype = os.getenv("VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE", "float16").strip().lower()
+        if dtype in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        if dtype in {"fp32", "float32"}:
+            return torch.float32
+        return torch.float16
+
+    def _router_analysis_dump_topk_tokens(self) -> int:
+        return max(int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS", "32") or 32), 0)
+
+    def _should_dump_router_analysis(self, global_step: int) -> bool:
+        if self._router_analysis_dump_mode() in {"", "0", "false", "off", "none", "disable", "disabled"}:
+            return False
+        if not self._router_analysis_dump_dir():
+            return False
+        max_steps = int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_STEPS", "0") or 0)
+        if max_steps > 0 and global_step >= max_steps:
+            return False
+        every_n = max(int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_EVERY_N", "1") or 1), 1)
+        return global_step % every_n == 0
+
+    @staticmethod
+    def _tensor_to_cpu(tensor: torch.Tensor | None, *, dtype: torch.dtype | None = None) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        tensor = tensor.detach()
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        return tensor.cpu()
+
+    def _maybe_dump_router_analysis(self, batch: DataProto, old_log_prob: DataProto, router_result) -> None:
+        global_step = int(getattr(self, "global_steps", -1))
+        if router_result is None or not self._should_dump_router_analysis(global_step):
+            return
+
+        mode = self._router_analysis_dump_mode()
+        if mode not in {"summary", "tokens", "sample", "full", "expert_counts"}:
+            raise ValueError(
+                "VERL_ROUTER_ANALYSIS_DUMP_MODE must be one of summary, tokens, sample, full, expert_counts; "
+                f"got {mode!r}"
+            )
+
+        dump_dir = self._router_analysis_dump_dir()
+        os.makedirs(dump_dir, exist_ok=True)
+        float_dtype = self._router_analysis_dump_float_dtype()
+        responses = batch.batch.get("responses")
+        attention_mask = batch.batch.get("attention_mask")
+        if responses is not None and attention_mask is not None:
+            response_mask = attention_mask[:, -responses.shape[-1] :].bool()
+        else:
+            response_mask = batch.batch["response_mask"].bool()
+        rs_reject_mask = batch.batch.get("router_mismatch_reject_mask")
+        old_log_probs = old_log_prob.batch.get("old_log_probs")
+        rollout_log_probs = batch.batch.get("rollout_log_probs")
+
+        seq_valid_token_count = router_result.seq_valid_token_count
+        seq_mismatch = router_result.seq_mismatch
+        token_mismatch = router_result.token_mismatch
+
+        with torch.no_grad():
+            seq_prob_diff = None
+            seq_logprob_diff = None
+            prob_diff = None
+            logprob_diff = None
+            if old_log_probs is not None and rollout_log_probs is not None:
+                mask = response_mask.to(device=old_log_probs.device)
+                rollout_log_probs = rollout_log_probs.to(device=old_log_probs.device)
+                valid_count = mask.float().sum(dim=-1).clamp_min(1.0)
+                prob_diff = (old_log_probs.float().exp() - rollout_log_probs.float().exp()).abs()
+                logprob_diff = (old_log_probs.float() - rollout_log_probs.float()).abs()
+                seq_prob_diff = (prob_diff * mask.float()).sum(dim=-1) / valid_count
+                seq_logprob_diff = (logprob_diff * mask.float()).sum(dim=-1) / valid_count
+
+            token_level_scores = batch.batch.get("token_level_scores")
+            seq_reward = token_level_scores.sum(dim=-1) if token_level_scores is not None else None
+            extreme_tokens = None
+            topk_tokens = self._router_analysis_dump_topk_tokens()
+            if topk_tokens > 0 and token_mismatch is not None:
+                mismatch_scores = token_mismatch.float()
+                valid_mask = response_mask.to(device=mismatch_scores.device)
+                scored = mismatch_scores.masked_fill(~valid_mask, float("-inf"))
+                k = min(topk_tokens, scored.shape[-1])
+                top_values, top_indices = torch.topk(scored, k=k, dim=-1, largest=True, sorted=True)
+                top_valid = torch.isfinite(top_values)
+                extreme_tokens = {
+                    "topk": k,
+                    "indices": self._tensor_to_cpu(top_indices, dtype=torch.int32),
+                    "valid": self._tensor_to_cpu(top_valid),
+                    "token_mismatch": self._tensor_to_cpu(top_values.masked_fill(~top_valid, 0.0), dtype=float_dtype),
+                }
+                if responses is not None:
+                    response_ids = responses.to(device=top_indices.device)
+                    extreme_tokens["token_ids"] = self._tensor_to_cpu(
+                        torch.gather(response_ids, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=torch.int32,
+                    )
+                if old_log_probs is not None:
+                    old_on_topk = old_log_probs.to(device=top_indices.device)
+                    extreme_tokens["old_log_probs"] = self._tensor_to_cpu(
+                        torch.gather(old_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if rollout_log_probs is not None:
+                    rollout_on_topk = rollout_log_probs.to(device=top_indices.device)
+                    extreme_tokens["rollout_log_probs"] = self._tensor_to_cpu(
+                        torch.gather(rollout_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if prob_diff is not None:
+                    prob_diff_on_topk = prob_diff.to(device=top_indices.device)
+                    extreme_tokens["prob_diff"] = self._tensor_to_cpu(
+                        torch.gather(prob_diff_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if logprob_diff is not None:
+                    logprob_diff_on_topk = logprob_diff.to(device=top_indices.device)
+                    extreme_tokens["logprob_diff"] = self._tensor_to_cpu(
+                        torch.gather(logprob_diff_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+            extreme_prob_diff_tokens = None
+            if topk_tokens > 0 and prob_diff is not None:
+                valid_mask = response_mask.to(device=prob_diff.device)
+                scored = prob_diff.float().masked_fill(~valid_mask, float("-inf"))
+                k = min(topk_tokens, scored.shape[-1])
+                top_values, top_indices = torch.topk(scored, k=k, dim=-1, largest=True, sorted=True)
+                top_valid = torch.isfinite(top_values)
+                extreme_prob_diff_tokens = {
+                    "topk": k,
+                    "indices": self._tensor_to_cpu(top_indices, dtype=torch.int32),
+                    "valid": self._tensor_to_cpu(top_valid),
+                    "prob_diff": self._tensor_to_cpu(top_values.masked_fill(~top_valid, 0.0), dtype=float_dtype),
+                }
+                if responses is not None:
+                    response_ids = responses.to(device=top_indices.device)
+                    extreme_prob_diff_tokens["token_ids"] = self._tensor_to_cpu(
+                        torch.gather(response_ids, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=torch.int32,
+                    )
+                if token_mismatch is not None:
+                    mismatch_on_topk = token_mismatch.to(device=top_indices.device)
+                    extreme_prob_diff_tokens["token_mismatch"] = self._tensor_to_cpu(
+                        torch.gather(mismatch_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if old_log_probs is not None:
+                    old_on_topk = old_log_probs.to(device=top_indices.device)
+                    extreme_prob_diff_tokens["old_log_probs"] = self._tensor_to_cpu(
+                        torch.gather(old_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if rollout_log_probs is not None:
+                    rollout_on_topk = rollout_log_probs.to(device=top_indices.device)
+                    extreme_prob_diff_tokens["rollout_log_probs"] = self._tensor_to_cpu(
+                        torch.gather(rollout_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if logprob_diff is not None:
+                    logprob_diff_on_topk = logprob_diff.to(device=top_indices.device)
+                    extreme_prob_diff_tokens["logprob_diff"] = self._tensor_to_cpu(
+                        torch.gather(logprob_diff_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+
+            payload = {
+                "metadata": {
+                    "global_step": global_step,
+                    "mode": mode,
+                    "alignment": int(router_result.alignment),
+                    "alignment_scores": router_result.alignment_scores,
+                    "batch_size": int(batch.batch.batch_size[0]) if batch.batch is not None else 0,
+                    "response_mask_shape": list(response_mask.shape),
+                    "response_mask_tokens": int(response_mask.sum().item()),
+                    "float_dtype": str(float_dtype),
+                    "extreme_token_topk": topk_tokens,
+                    "rollout_routes_shape": list(batch.batch["routed_experts"].shape)
+                    if "routed_experts" in batch.batch
+                    else None,
+                    "train_routes_shape": list(old_log_prob.batch["routed_experts"].shape)
+                    if "routed_experts" in old_log_prob.batch
+                    else None,
+                    "rollout_routes_dtype": str(batch.batch["routed_experts"].dtype)
+                    if "routed_experts" in batch.batch
+                    else None,
+                    "train_routes_dtype": str(old_log_prob.batch["routed_experts"].dtype)
+                    if "routed_experts" in old_log_prob.batch
+                    else None,
+                    "metric_names": sorted(router_result.metrics.keys()),
+                },
+                "metrics": dict(router_result.metrics),
+                "response_summary": {
+                    "seq_mismatch": self._tensor_to_cpu(seq_mismatch, dtype=torch.float32),
+                    "seq_valid_token_count": self._tensor_to_cpu(seq_valid_token_count, dtype=torch.float32),
+                    "seq_prob_diff": self._tensor_to_cpu(seq_prob_diff, dtype=torch.float32),
+                    "seq_logprob_diff": self._tensor_to_cpu(seq_logprob_diff, dtype=torch.float32),
+                    "seq_reward": self._tensor_to_cpu(seq_reward, dtype=torch.float32),
+                    "rs_reject_mask": self._tensor_to_cpu(rs_reject_mask),
+                    "extreme_tokens": extreme_tokens,
+                    "extreme_prob_diff_tokens": extreme_prob_diff_tokens,
+                    "expert_usage_distances": {
+                        name: self._tensor_to_cpu(values, dtype=torch.float32)
+                        for name, values in (router_result.expert_usage_distances or {}).items()
+                    },
+                },
+            }
+
+            uids = batch.non_tensor_batch.get("uid") if hasattr(batch, "non_tensor_batch") else None
+            if uids is not None:
+                payload["uids"] = [str(uid) for uid in uids]
+
+            if mode in {"tokens", "sample", "full"}:
+                payload["token_data"] = {
+                    "responses": self._tensor_to_cpu(responses, dtype=torch.int32),
+                    "response_mask": self._tensor_to_cpu(response_mask),
+                    "attention_mask": self._tensor_to_cpu(attention_mask),
+                    "token_mismatch": self._tensor_to_cpu(token_mismatch, dtype=float_dtype),
+                    "old_log_probs": self._tensor_to_cpu(old_log_probs, dtype=float_dtype),
+                    "rollout_log_probs": self._tensor_to_cpu(rollout_log_probs, dtype=float_dtype),
+                    "logprob_delta": self._tensor_to_cpu(
+                        old_log_probs.float() - rollout_log_probs.float()
+                        if old_log_probs is not None and rollout_log_probs is not None
+                        else None,
+                        dtype=float_dtype,
+                    ),
+                    "logprob_diff": self._tensor_to_cpu(logprob_diff, dtype=float_dtype),
+                    "prob_diff": self._tensor_to_cpu(prob_diff, dtype=float_dtype),
+                }
+
+            if mode in {"sample", "full"}:
+                route_limit = int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_SAMPLES", "16") or 16)
+                route_count = int(response_mask.shape[0]) if mode == "full" else min(route_limit, int(response_mask.shape[0]))
+                route_slice = slice(0, route_count)
+                payload["routed_experts"] = {
+                    "sample_count": route_count,
+                    "rollout": self._tensor_to_cpu(batch.batch["routed_experts"][route_slice])
+                    if "routed_experts" in batch.batch
+                    else None,
+                    "train": self._tensor_to_cpu(old_log_prob.batch["routed_experts"][route_slice])
+                    if "routed_experts" in old_log_prob.batch
+                    else None,
+                }
+
+            if mode == "expert_counts":
+                if router_result.expert_usage_counts is None:
+                    raise RuntimeError(
+                        "expert_counts dump mode requires per-response expert counts, but none were captured"
+                    )
+                payload["expert_usage"] = {
+                    "distances_by_layer": {
+                        name: self._tensor_to_cpu(values, dtype=float_dtype)
+                        for name, values in (router_result.expert_usage_distances_by_layer or {}).items()
+                    },
+                    "counts": {
+                        side: self._tensor_to_cpu(values)
+                        for side, values in router_result.expert_usage_counts.items()
+                    },
+                }
+
+        path = os.path.join(dump_dir, f"router_analysis_step{global_step:04d}_pid{os.getpid()}.pt")
+        torch.save(payload, path)
 
     def compute_kl_related_metrics(self, batch: DataProto, metrics: dict, timing_raw: dict):
         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -111,6 +489,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     metrics.update(router_result.metrics)
                     with marked_timer("router_mismatch_rs", timing_raw, "blue"):
                         metrics.update(self._apply_router_mismatch_rs(batch, router_result))
+                    self._maybe_dump_router_analysis(batch, old_log_prob, router_result)
+                    batch.batch.pop("router_mismatch_reject_mask", None)
                 old_log_prob.batch.pop("routed_experts")
                 batch.batch.pop("routed_experts")
             batch = batch.union(old_log_prob)
@@ -263,6 +643,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                         # we combine with rule-based rm
                         reward_tensor, reward_extra_infos_dict = extract_reward(new_batch)
+                        self._maybe_log_extract_reward_debug(new_batch, reward_tensor, reward_extra_infos_dict)
 
                         new_batch.batch["token_level_scores"] = reward_tensor
 
@@ -494,6 +875,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                if self.config.trainer.get("log_epoch_number", False):
+                    metrics["training/epoch_number"] = epoch + 1
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

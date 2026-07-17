@@ -62,13 +62,27 @@ router:
   # Router mismatch rejection mode:
   # - threshold: drop responses whose seq_mismatch exceeds mismatch_rs_threshold.
   # - top_fraction: drop the highest mismatch_rs_fraction fraction in each batch.
+  # - length_bucket_top_fraction: drop the highest mismatch_rs_fraction fraction inside each response-length bucket.
+  # - length_bucket_mad_zscore_top_fraction: normalize scores by bucket median/MAD,
+  #   then globally drop the highest mismatch_rs_fraction subject to a per-prompt cap.
+  # - length_conditional_percentile_top_fraction: rank each score among nearby
+  #   response lengths, then globally drop the highest conditional percentiles.
   mismatch_rs_mode: threshold
   mismatch_rs_fraction: 0.1
+  mismatch_rs_length_bucket_edges: [2048, 4096, 8192, 12288]
+  mismatch_rs_max_reject_per_prompt: null
+  mismatch_rs_mad_epsilon: 1.0e-6
+  mismatch_rs_local_window: 256
+  mismatch_rs_censored_length: null
+  mismatch_rs_min_censored_count: 32
 
   # Sequence mismatch metric mode:
   # - exact_set: a layer mismatches unless the full top-k expert set is identical.
   # - overlap_fraction: layer_mismatch = 1 - top-k overlap / top-k.
+  # - expert_usage_l1: response/layer expert-usage TV distance with short-sequence shrinkage.
   mismatch_metric_mode: exact_set
+  expert_usage_smoothing_tau: 4096.0
+  expert_usage_num_experts: null
 
   # Number of router-mismatch steps used to pick the best token alignment from
   # {0, -1, 1}. After warmup, the trainer reuses the frozen alignment.
