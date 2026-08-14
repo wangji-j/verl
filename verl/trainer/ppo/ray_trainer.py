@@ -1422,6 +1422,26 @@ class RayPPOTrainer:
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
 
+    def _ensure_router_mismatch_state(self) -> None:
+        """Idempotently initialize the router-mismatch instance state.
+
+        ``RayPPOTrainer.__init__`` sets these attributes, but some trainers
+        (e.g. the fully-async ``FullyAsyncTrainer``) re-implement ``__init__``
+        without calling ``super().__init__()`` and therefore never create them.
+        The RDC rejection-sampling path calls this before touching the state so
+        it works regardless of the init chain. No-op once initialized (and for
+        trainers that already went through ``RayPPOTrainer.__init__``).
+        """
+        if hasattr(self, "router_mismatch_metrics_enabled"):
+            return
+        self.router_mismatch_metrics_enabled = bool(
+            OmegaConf.select(self.config, "router.enable_mismatch_metrics", default=False)
+        )
+        self._router_mismatch_alignment_sums = defaultdict(float)
+        self._router_mismatch_alignment_counts = defaultdict(int)
+        self._router_mismatch_alignment_observations = 0
+        self._router_mismatch_frozen_alignment = None
+
     def _router_mismatch_rs_enabled(self) -> bool:
         return bool(OmegaConf.select(self.config, "router.enable_mismatch_rs", default=False))
 

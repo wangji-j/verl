@@ -533,6 +533,21 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 old_log_prob.batch.pop("entropys")
                 if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                     router_mode = getattr(self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled")
+                    # RDC (Router Drift Control) static rejection sampling. In the fully-async
+                    # disaggregated setting, rollout routes are captured at generation-time params
+                    # (V_gen) and carried on the sample, while old_log_prob is a train-side forward
+                    # at the current/anchor params -- so comparing here masks exactly the
+                    # staleness-induced router drift before advantage/update. Both helpers are
+                    # inherited from RayPPOTrainer and are inert unless router.enable_mismatch_rs
+                    # is set, so this is a no-op for all existing separation/async recipes.
+                    if self._router_mismatch_rs_enabled():
+                        # Async trainers may skip RayPPOTrainer.__init__; make sure
+                        # the router-mismatch state exists before using it.
+                        self._ensure_router_mismatch_state()
+                        router_result = self._compute_router_mismatch_result(batch, old_log_prob)
+                        rs_metrics = self._apply_router_mismatch_rs(batch, router_result)
+                        if rs_metrics:
+                            metrics.update(rs_metrics)
                     if router_mode == "R2":
                         batch.batch.pop("routed_experts")
                     else:
