@@ -161,6 +161,9 @@ val_kwargs:
   # Whether to sample during training rollout. False uses greedy sampling.
   do_sample: False
 
+  # Optional validation-only response length. Null reuses rollout.response_length.
+  max_response_length: null
+
 # Multi-turn tool config.
 multi_turn:
 

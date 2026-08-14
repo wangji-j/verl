@@ -3,16 +3,23 @@ set -xeuo pipefail
 
 ulimit -c 0 || true
 
+# math-verify is required by the MATH-500 validation scorer on every node;
+# verl's wrapper silently returns 0.0 if the import fails, so ensure it here.
+python3 -c "import math_verify" 2>/dev/null || pip install --quiet --no-index \
+    --find-links /inspire/hdd/project/qianghuaxuexi/public/wheels math-verify || \
+    echo "WARNING: math-verify install failed; MATH-500 validation scores will be 0"
+
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
+export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
 export WANDB_MODE=${WANDB_MODE:-online}
 
 run_timestamp=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
 project_name=${PROJECT_NAME:-jly-DAPO-DEEPSCALER-FP8-ROLLOUT}
-exp_name_base=${EXPERIMENT_NAME_BASE:-DAPO-DEEPSCALER-Qwen3-30B-A3B-INSTRUCT2507-VLLM-FP8-ROLLOUT-PBS256-N8-MINISTEP1-LR3E-6-30K-REFLOSS-AIMEAVG32}
+exp_name_base=${EXPERIMENT_NAME_BASE:-DAPO-DEEPSCALER-Qwen3-30B-A3B-BASE-VLLM-FP8-ROLLOUT-PBS256-N8-MINISTEP1-LR3E-6-30K-REFLOSS-AIMEAVG32}
 exp_name=${EXPERIMENT_NAME:-${exp_name_base}_${run_timestamp}}
 
 adv_estimator=grpo
@@ -51,7 +58,7 @@ WORKING_DIR=${WORKING_DIR:-"/inspire/hdd/project/qianghuaxuexi/public/jly-verl"}
 RECIPE_DIR=${RECIPE_DIR:-"/inspire/hdd/project/qianghuaxuexi/public/verl-low"}
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/inspire/hdd/project/qianghuaxuexi/public"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B-Instruct-2507"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B-Base"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 GSM8K_DIR=${GSM8K_DIR:-"${RAY_DATA_HOME}/datasets/gsm8k"}
 DEEPSCALER_DIR=${DEEPSCALER_DIR:-"${RAY_DATA_HOME}/datasets/deepscaler"}
@@ -87,7 +94,7 @@ rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-128}
 rollout_enforce_eager=${ROLLOUT_ENFORCE_EAGER:-False}
 val_before_train=${VAL_BEFORE_TRAIN:-True}
 test_freq=${TEST_FREQ:-10}
-save_freq=${SAVE_FREQ:-20}
+save_freq=${SAVE_FREQ:-50}
 total_training_steps=${TOTAL_TRAINING_STEPS:-500}
 
 export PYTHONPATH="${RECIPE_DIR}:${WORKING_DIR}:${PYTHONPATH:-}"

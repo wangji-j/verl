@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
+export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
+
 project_name='DAPO-FP8-ROLLOUT'
 exp_name='DAPO-Qwen3-MOE-30B-VLLM-FP8-ROLLOUT'
 
@@ -50,7 +53,7 @@ echo "NNODES: ${NNODES}"
 
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH="Qwen/Qwen3-30B-A3B-Base"
+MODEL_PATH=${MODEL_PATH:-"/inspire/hdd/project/qianghuaxuexi/public/models/Qwen3-30B-A3B-Base"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
@@ -161,7 +164,7 @@ RAY_ADDRESS='http://127.0.0.1:8265' ray job submit --runtime-env=${RUNTIME_ENV} 
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=False \
     trainer.test_freq=5 \
-    trainer.save_freq=20 \
+    trainer.save_freq=50 \
     trainer.total_epochs=100 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \

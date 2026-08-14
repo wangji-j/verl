@@ -26,6 +26,7 @@ from pprint import pprint
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from verl import DataProto
@@ -50,6 +51,272 @@ class RayDAPOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+
+    _ROUTER_MISMATCH_METRIC_PREFIX = "router/rollout_vs_train/"
+
+    def _current_aware_router_mismatch_rs_enabled(self) -> bool:
+        """Return whether RDC is applied immediately before every PPO mini-step."""
+        return bool(OmegaConf.select(self.config, "router.enable_current_aware_mismatch_rs", default=False))
+
+    def _validate_current_aware_router_mismatch_rs(self) -> None:
+        """Fail early when the requested RDC experiment cannot have the intended semantics."""
+        if not self._current_aware_router_mismatch_rs_enabled():
+            return
+
+        if not self.router_mismatch_metrics_enabled:
+            raise ValueError(
+                "router.enable_current_aware_mismatch_rs=True requires "
+                "router.enable_mismatch_metrics=True."
+            )
+        if not self._router_mismatch_rs_enabled():
+            raise ValueError(
+                "router.enable_current_aware_mismatch_rs=True requires router.enable_mismatch_rs=True."
+            )
+
+        ppo_epochs = int(self.config.actor_rollout_ref.actor.ppo_epochs)
+        if ppo_epochs != 1:
+            raise ValueError(
+                "Current-aware router filtering defines one current-route probe followed by one optimizer "
+                f"update per PPO mini-step, so actor.ppo_epochs must be 1; got {ppo_epochs}."
+            )
+
+        router_replay_mode = str(self.config.actor_rollout_ref.actor.megatron.router_replay.mode)
+        if router_replay_mode != "disabled":
+            raise ValueError(
+                "Current-aware router filtering must measure BF16 free routing, so "
+                "actor.megatron.router_replay.mode must be 'disabled'; "
+                f"got {router_replay_mode!r}."
+            )
+
+        alignment_warmup_steps = self._router_mismatch_alignment_warmup_steps()
+        if alignment_warmup_steps != 1:
+            raise ValueError(
+                "Current-aware router filtering requires router.mismatch_alignment_warmup_steps=1 so the "
+                "full theta_0 batch freezes one shared alignment before mini-step filtering; "
+                f"got {alignment_warmup_steps}."
+            )
+
+        train_prompt_batch_size = int(self.config.data.train_batch_size)
+        mini_prompt_batch_size = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        if mini_prompt_batch_size <= 0 or train_prompt_batch_size % mini_prompt_batch_size != 0:
+            raise ValueError(
+                "data.train_batch_size must be divisible by actor.ppo_mini_batch_size for current-aware "
+                f"router filtering; got {train_prompt_batch_size} and {mini_prompt_batch_size}."
+            )
+
+    @classmethod
+    def _rename_current_aware_router_metrics(cls, values: dict, mini_step: int) -> dict:
+        """Move the existing static mismatch metrics into an RDC mini-step namespace."""
+        target_prefix = f"router/rdc/mini_step_{mini_step}/"
+        renamed = {}
+        for key, value in values.items():
+            if key.startswith(cls._ROUTER_MISMATCH_METRIC_PREFIX):
+                key = target_prefix + key[len(cls._ROUTER_MISMATCH_METRIC_PREFIX) :]
+            else:
+                key = target_prefix + key
+            renamed[key] = value
+        return renamed
+
+    def _update_actor_with_current_aware_router_filter(
+        self,
+        batch: DataProto,
+        metrics: dict,
+        timing_raw: dict,
+    ) -> DataProto:
+        """Probe current routes, reject within each length bucket, then update each mini-batch once.
+
+        ``old_log_probs`` and TIS weights remain those computed once at the start of the
+        rollout batch. Only the route comparison is refreshed: mini-step ``j`` compares
+        the cached FP8 rollout routes with free BF16 routes under ``theta_(j-1)``.
+        """
+        if "routed_experts" not in batch.batch:
+            raise RuntimeError(
+                "Current-aware router filtering requires cached FP8 rollout routed_experts in the PPO batch."
+            )
+
+        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+        mini_prompt_batch_size = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        mini_response_batch_size = mini_prompt_batch_size * rollout_n
+        if len(batch) % mini_response_batch_size != 0:
+            raise ValueError(
+                "The response batch must split exactly into PPO mini-batches for current-aware router "
+                f"filtering; got responses={len(batch)}, mini_response_batch_size={mini_response_batch_size}."
+            )
+
+        # The controller batch is rank-major after balancing/dispatch: all
+        # samples for actor DP rank 0, then rank 1, and so on. Match the native
+        # worker iterator by taking one slice from every rank partition for each
+        # global mini-step. A plain contiguous split would make early steps draw
+        # from only the first rank partition when actor DP > 1.
+        actor_dp_size = int(self._get_dp_size(self.actor_rollout_wg, "actor"))
+        if actor_dp_size <= 0 or len(batch) % actor_dp_size != 0:
+            raise ValueError(
+                "The RDC response batch must split evenly across actor DP ranks; "
+                f"got responses={len(batch)}, actor_dp_size={actor_dp_size}."
+            )
+        if mini_response_batch_size % actor_dp_size != 0:
+            raise ValueError(
+                "Each RDC mini-batch must split evenly across actor DP ranks; "
+                f"got mini_response_batch_size={mini_response_batch_size}, actor_dp_size={actor_dp_size}."
+            )
+        num_mini_steps = len(batch) // mini_response_batch_size
+        responses_per_dp = len(batch) // actor_dp_size
+        mini_responses_per_dp = mini_response_batch_size // actor_dp_size
+        mini_batch_indices = []
+        for mini_step_idx in range(num_mini_steps):
+            mini_indices = []
+            for dp_rank in range(actor_dp_size):
+                start = dp_rank * responses_per_dp + mini_step_idx * mini_responses_per_dp
+                mini_indices.extend(range(start, start + mini_responses_per_dp))
+            mini_batch_indices.append(mini_indices)
+
+        actor_metrics_across_steps: dict[str, list] = defaultdict(list)
+        updated_response_mask = batch.batch["response_mask"].clone()
+        total_rejected = 0.0
+        total_valid = 0.0
+        total_valid_tokens_before = 0.0
+        total_valid_tokens_after = 0.0
+        bucket_totals: dict[int, dict[str, float]] = defaultdict(lambda: {"count": 0.0, "rejected": 0.0})
+        bucket_count = len(self._router_mismatch_rs_length_bucket_edges()) + 1
+
+        metrics["router/rdc/enabled"] = 1.0
+        metrics["router/rdc/mini_steps"] = float(num_mini_steps)
+        metrics["router/rdc/mini_prompt_batch_size"] = float(mini_prompt_batch_size)
+        metrics["router/rdc/mini_response_batch_size"] = float(mini_response_batch_size)
+        metrics["router/rdc/actor_dp_size"] = float(actor_dp_size)
+        metrics["router/rdc/mini_response_batch_size_per_dp"] = float(mini_responses_per_dp)
+        metrics["router/rdc/configured_rejected_fraction"] = self._router_mismatch_rs_fraction()
+
+        for mini_step, mini_indices in enumerate(mini_batch_indices, start=1):
+            # Materialize only the mini-batch being probed/updated. Building all
+            # advanced-indexed mini-batches up front would duplicate the full
+            # cached route tensor on the controller.
+            mini_batch = batch[mini_indices]
+            # The actor has theta_(j-1) here. compute_old_log_prob is used only as
+            # a teacher-forced current-route probe; its probabilities are discarded.
+            # Do not send behavior routes into this forward: besides saving an
+            # unnecessary device copy, removing them makes the free-routing
+            # semantics explicit. Restore them only for the distance comparison.
+            rollout_routes = mini_batch.batch.pop("routed_experts")
+            try:
+                with marked_timer("rdc_current_route", timing_raw, "blue"):
+                    current_actor_output, current_actor_mfu = self._compute_old_log_prob(mini_batch)
+            finally:
+                mini_batch.batch["routed_experts"] = rollout_routes
+            if "routed_experts" not in current_actor_output.batch:
+                raise RuntimeError(
+                    "Current-aware router filtering did not receive routed_experts from the current BF16 actor."
+                )
+
+            with marked_timer("rdc_router_mismatch", timing_raw, "blue"):
+                router_result = self._compute_router_mismatch_result(mini_batch, current_actor_output)
+            if router_result is None:
+                raise RuntimeError("Current-aware router filtering could not compute router mismatch metrics.")
+
+            step_metrics = dict(router_result.metrics)
+            valid_tokens_before = float(mini_batch.batch["response_mask"].sum().item())
+            with marked_timer("rdc_router_filter", timing_raw, "blue"):
+                filter_metrics = self._apply_router_mismatch_rs(mini_batch, router_result)
+            valid_tokens_after = float(mini_batch.batch["response_mask"].sum().item())
+            rejected_tokens = max(valid_tokens_before - valid_tokens_after, 0.0)
+            step_metrics.update(filter_metrics)
+            step_metrics["current_actor_mfu"] = current_actor_mfu
+            step_metrics["response_count"] = float(len(mini_batch))
+            metrics.update(self._rename_current_aware_router_metrics(step_metrics, mini_step))
+
+            rejected = float(filter_metrics.get("router/rollout_vs_train/rs_rejected_count", 0.0))
+            kept = float(filter_metrics.get("router/rollout_vs_train/rs_kept_count", 0.0))
+            valid_responses = rejected + kept
+            actual_rejected_fraction = rejected / valid_responses if valid_responses > 0 else 0.0
+            total_rejected += rejected
+            total_valid += valid_responses
+            total_valid_tokens_before += valid_tokens_before
+            total_valid_tokens_after += valid_tokens_after
+            step_filter_prefix = f"router/rdc/mini_step_{mini_step}/filter"
+            step_filter_summary = {
+                f"{step_filter_prefix}/total_response_count": float(len(mini_batch)),
+                f"{step_filter_prefix}/valid_response_count": valid_responses,
+                f"{step_filter_prefix}/filtered_response_count": rejected,
+                f"{step_filter_prefix}/rejected_response_count": rejected,
+                f"{step_filter_prefix}/kept_response_count": kept,
+                f"{step_filter_prefix}/actual_rejected_fraction": actual_rejected_fraction,
+                f"{step_filter_prefix}/configured_rejected_fraction": self._router_mismatch_rs_fraction(),
+                f"{step_filter_prefix}/valid_token_count_before": valid_tokens_before,
+                f"{step_filter_prefix}/valid_token_count_after": valid_tokens_after,
+                f"{step_filter_prefix}/rejected_token_count": rejected_tokens,
+                f"{step_filter_prefix}/rejected_token_fraction": (
+                    rejected_tokens / valid_tokens_before if valid_tokens_before > 0 else 0.0
+                ),
+            }
+            for bucket_idx in range(bucket_count):
+                source_prefix = f"router/rollout_vs_train/rs_bucket_{bucket_idx}"
+                bucket_totals[bucket_idx]["count"] += float(filter_metrics.get(f"{source_prefix}_count", 0.0))
+                bucket_totals[bucket_idx]["rejected"] += float(
+                    filter_metrics.get(f"{source_prefix}_rejected_count", 0.0)
+                )
+
+            # The probe's log-probs, entropy, and current routed-expert tensor
+            # are not PPO anchors. Release them before the backward pass so the
+            # extra teacher-forced probe does not inflate peak actor memory.
+            del current_actor_output, router_result
+
+            # Keep only the filtered response mask for training. The current
+            # probabilities/entropy are deliberately not merged into the batch.
+            updated_response_mask[mini_indices] = mini_batch.batch["response_mask"]
+            mini_batch.batch.pop("router_mismatch_reject_mask", None)
+            mini_batch.batch.pop("routed_experts")
+            del rollout_routes
+            # The native worker advances the LR scheduler once after all PPO
+            # mini-batches in a rollout batch. RDC uses one RPC per mini-step,
+            # so suppress scheduler advancement until the final RPC.
+            mini_batch.meta_info["update_lr_scheduler_at_end"] = mini_step == num_mini_steps
+
+            with marked_timer("rdc_actor_update", timing_raw, "red"):
+                actor_output = self._update_actor(mini_batch)
+            # These summaries are attached only after the corresponding actor
+            # update returns successfully. The trainer flushes them together at
+            # the end of the enclosing global training step.
+            metrics.update(step_filter_summary)
+            step_prefix = f"router/rdc/mini_step_{mini_step}"
+            metrics[f"{step_prefix}/update_completed"] = 1.0
+            metrics[f"{step_prefix}/cumulative_filtered_response_count"] = total_rejected
+            metrics[f"{step_prefix}/cumulative_valid_response_count"] = total_valid
+            metrics[f"{step_prefix}/cumulative_actual_rejected_fraction"] = (
+                total_rejected / total_valid if total_valid > 0 else 0.0
+            )
+            cumulative_rejected_tokens = total_valid_tokens_before - total_valid_tokens_after
+            metrics[f"{step_prefix}/cumulative_rejected_token_count"] = cumulative_rejected_tokens
+            metrics[f"{step_prefix}/cumulative_rejected_token_fraction"] = (
+                cumulative_rejected_tokens / total_valid_tokens_before if total_valid_tokens_before > 0 else 0.0
+            )
+            step_actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+            for key, value in step_actor_metrics.items():
+                actor_metrics_across_steps[key].append(value)
+
+        # Advanced indexing creates independent mini-batches, so write every
+        # filtered mask back in the original controller-batch order.
+        batch.batch["response_mask"] = updated_response_mask
+        batch.batch.pop("routed_experts")
+        metrics["router/rdc/rejected_count"] = total_rejected
+        metrics["router/rdc/valid_response_count"] = total_valid
+        metrics["router/rdc/rejected_fraction"] = total_rejected / total_valid if total_valid > 0 else 0.0
+        metrics["router/rdc/valid_token_count_before"] = total_valid_tokens_before
+        metrics["router/rdc/valid_token_count_after"] = total_valid_tokens_after
+        metrics["router/rdc/rejected_token_count"] = total_valid_tokens_before - total_valid_tokens_after
+        metrics["router/rdc/rejected_token_fraction"] = (
+            (total_valid_tokens_before - total_valid_tokens_after) / total_valid_tokens_before
+            if total_valid_tokens_before > 0
+            else 0.0
+        )
+        for bucket_idx, totals in bucket_totals.items():
+            count = totals["count"]
+            rejected = totals["rejected"]
+            prefix = f"router/rdc/rs_bucket_{bucket_idx}"
+            metrics[f"{prefix}_count"] = count
+            metrics[f"{prefix}_rejected_count"] = rejected
+            metrics[f"{prefix}_rejected_fraction"] = rejected / count if count > 0 else 0.0
+
+        return DataProto.from_single_dict(data={}, meta_info={"metrics": dict(actor_metrics_across_steps)})
 
     def _reward_extract_debug_enabled(self) -> bool:
         return bool(os.getenv("VERL_REWARD_DEBUG_DIR", "").strip())
@@ -432,31 +699,41 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # recompute old_log_probs
         with marked_timer("old_log_prob", timing_raw, "blue"):
-            with marked_timer("old_log_prob_forward", timing_raw, "blue"):
-                old_log_prob_debug_device = (
-                    batch.batch["responses"].device if "responses" in batch.batch else torch.device("cuda")
-                )
-                old_log_prob_debug_before = self._cuda_memory_snapshot(old_log_prob_debug_device)
-                old_log_prob_debug_t0 = time.perf_counter()
-                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                old_log_prob_debug_after = self._cuda_memory_snapshot(old_log_prob_debug_device)
-                self._write_perf_debug(
-                    "old_log_prob_forward",
-                    {
-                        "duration_s": time.perf_counter() - old_log_prob_debug_t0,
-                        "batch_size": int(batch.batch.batch_size[0]) if batch.batch is not None else 0,
-                        "responses_shape": list(batch.batch["responses"].shape)
-                        if "responses" in batch.batch
-                        else None,
-                        "response_mask_tokens": int(batch.batch["response_mask"].sum().item())
-                        if "response_mask" in batch.batch
-                        else None,
-                        "returned_keys": list(old_log_prob.batch.keys()),
-                        "mfu": old_log_prob_mfu,
-                        **{f"before_{k}": v for k, v in old_log_prob_debug_before.items()},
-                        **{f"after_{k}": v for k, v in old_log_prob_debug_after.items()},
-                    },
-                )
+            # RDC needs a free BF16 theta_0 route here, while retaining the FP8
+            # behavior route on the driver for later mini-steps. Do not serialize
+            # that large cached tensor into the actor forward request.
+            cached_rollout_routes = None
+            if self._current_aware_router_mismatch_rs_enabled():
+                cached_rollout_routes = batch.batch.pop("routed_experts", None)
+            try:
+                with marked_timer("old_log_prob_forward", timing_raw, "blue"):
+                    old_log_prob_debug_device = (
+                        batch.batch["responses"].device if "responses" in batch.batch else torch.device("cuda")
+                    )
+                    old_log_prob_debug_before = self._cuda_memory_snapshot(old_log_prob_debug_device)
+                    old_log_prob_debug_t0 = time.perf_counter()
+                    old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                    old_log_prob_debug_after = self._cuda_memory_snapshot(old_log_prob_debug_device)
+                    self._write_perf_debug(
+                        "old_log_prob_forward",
+                        {
+                            "duration_s": time.perf_counter() - old_log_prob_debug_t0,
+                            "batch_size": int(batch.batch.batch_size[0]) if batch.batch is not None else 0,
+                            "responses_shape": list(batch.batch["responses"].shape)
+                            if "responses" in batch.batch
+                            else None,
+                            "response_mask_tokens": int(batch.batch["response_mask"].sum().item())
+                            if "response_mask" in batch.batch
+                            else None,
+                            "returned_keys": list(old_log_prob.batch.keys()),
+                            "mfu": old_log_prob_mfu,
+                            **{f"before_{k}": v for k, v in old_log_prob_debug_before.items()},
+                            **{f"after_{k}": v for k, v in old_log_prob_debug_after.items()},
+                        },
+                    )
+            finally:
+                if cached_rollout_routes is not None:
+                    batch.batch["routed_experts"] = cached_rollout_routes
             entropys = old_log_prob.batch["entropys"]
             response_masks = batch.batch["response_mask"]
             actor_config = self.config.actor_rollout_ref.actor
@@ -487,18 +764,33 @@ class RayDAPOTrainer(RayPPOTrainer):
                     router_result = self._compute_router_mismatch_result(batch, old_log_prob)
                 if router_result is not None:
                     metrics.update(router_result.metrics)
-                    with marked_timer("router_mismatch_rs", timing_raw, "blue"):
-                        metrics.update(self._apply_router_mismatch_rs(batch, router_result))
+                    # Static RS compares rollout routes with theta_0 once for the
+                    # whole batch. RDC instead performs rejection immediately
+                    # before each mini-step using theta_(j-1), so do not mask here.
+                    if not self._current_aware_router_mismatch_rs_enabled():
+                        with marked_timer("router_mismatch_rs", timing_raw, "blue"):
+                            metrics.update(self._apply_router_mismatch_rs(batch, router_result))
                     self._maybe_dump_router_analysis(batch, old_log_prob, router_result)
                     batch.batch.pop("router_mismatch_reject_mask", None)
                 old_log_prob.batch.pop("routed_experts")
-                batch.batch.pop("routed_experts")
+                if not self._current_aware_router_mismatch_rs_enabled():
+                    batch.batch.pop("routed_experts")
             batch = batch.union(old_log_prob)
 
         if self.use_reference_policy:
             # compute reference log_prob
             with marked_timer("ref", timing_raw, "olive"):
-                ref_log_prob = self._compute_ref_log_prob(batch)
+                # Reference scoring never consumes router traces. Keep the RDC
+                # behavior-route cache on the driver instead of copying it to the
+                # reference worker.
+                cached_rollout_routes = None
+                if self._current_aware_router_mismatch_rs_enabled():
+                    cached_rollout_routes = batch.batch.pop("routed_experts", None)
+                try:
+                    ref_log_prob = self._compute_ref_log_prob(batch)
+                finally:
+                    if cached_rollout_routes is not None:
+                        batch.batch["routed_experts"] = cached_rollout_routes
                 batch = batch.union(ref_log_prob)
 
         return batch
@@ -510,9 +802,9 @@ class RayDAPOTrainer(RayPPOTrainer):
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        from omegaconf import OmegaConf
-
         from verl.utils.tracking import Tracking
+
+        self._validate_current_aware_router_mismatch_rs()
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -778,7 +1070,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, "cyan"):
-                            values = self._compute_values(batch)
+                            cached_rollout_routes = None
+                            if self._current_aware_router_mismatch_rs_enabled():
+                                cached_rollout_routes = batch.batch.pop("routed_experts", None)
+                            try:
+                                values = self._compute_values(batch)
+                            finally:
+                                if cached_rollout_routes is not None:
+                                    batch.batch["routed_experts"] = cached_rollout_routes
                             batch = batch.union(values)
 
                     # Compute rollout correction weights and off-policy metrics (inherited from RayPPOTrainer)
@@ -810,7 +1109,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, "pink"):
-                            critic_output = self._update_critic(batch)
+                            cached_rollout_routes = None
+                            if self._current_aware_router_mismatch_rs_enabled():
+                                cached_rollout_routes = batch.batch.pop("routed_experts", None)
+                            try:
+                                critic_output = self._update_critic(batch)
+                            finally:
+                                if cached_rollout_routes is not None:
+                                    batch.batch["routed_experts"] = cached_rollout_routes
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
@@ -818,7 +1124,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, "red"):
-                            actor_output = self._update_actor(batch)
+                            if self._current_aware_router_mismatch_rs_enabled():
+                                actor_output = self._update_actor_with_current_aware_router_filter(
+                                    batch,
+                                    metrics,
+                                    timing_raw,
+                                )
+                            else:
+                                actor_output = self._update_actor(batch)
 
                         # Check if ESI/training plan is close to expiration
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -839,6 +1152,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                             self.checkpoint_manager.update_weights()
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                    elif self._current_aware_router_mismatch_rs_enabled():
+                        # No actor update occurs during critic warmup. Release the
+                        # cached rollout route tensor retained for RDC.
+                        batch.batch.pop("routed_experts", None)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

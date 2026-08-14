@@ -55,6 +55,12 @@ router:
   # Whether to drop whole responses whose sequence-level router mismatch exceeds a threshold.
   enable_mismatch_rs: False
 
+  # Whether to defer router-mismatch rejection to each PPO mini-step. Before
+  # every actor update, rerun the same mini-batch through the current BF16
+  # actor with free routing and compare it with the cached FP8 rollout routes.
+  # When enabled, the once-per-rollout static rejection above is skipped.
+  enable_current_aware_mismatch_rs: False
+
   # Sequence-level router mismatch threshold. The score is the response average
   # of per-token mismatched-layer fraction, so it ranges from 0.0 to 1.0.
   mismatch_rs_threshold: 0.8

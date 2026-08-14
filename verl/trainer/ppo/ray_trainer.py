@@ -61,11 +61,13 @@ from verl.trainer.ppo.utils import (
 )
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.checkpoint.local_retention import cleanup_local_global_step_checkpoints
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
+from verl.utils.reward_extra_info import extend_aligned_reward_extra_infos
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.router_mismatch_metrics import (
     compute_length_conditional_percentiles,
@@ -625,8 +627,13 @@ class RayPPOTrainer:
         # Take first N samples after shuffling
         samples = samples[:generations_to_log]
 
-        # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        # Log to each configured logger. Logging backends (e.g. wandb) can hit
+        # transient server errors (502, auth re-verification); never let a
+        # sample-logging failure kill a multi-day training run.
+        try:
+            self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        except Exception as e:
+            print(f"WARNING: failed to log validation generations (non-fatal): {e}")
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -747,16 +754,16 @@ class RayPPOTrainer:
             validate_reward_s += time.perf_counter() - reward_t0
 
             scores = reward_tensor.sum(-1).cpu().tolist()
+            prior_sample_count = len(sample_scores)
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
-            for key, values in reward_extra_info.items():
-                if key not in reward_extra_infos_dict:
-                    reward_extra_infos_dict[key] = []
-                if isinstance(values, np.ndarray):
-                    reward_extra_infos_dict[key].extend(values.tolist())
-                else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+            extend_aligned_reward_extra_infos(
+                reward_extra_infos_dict,
+                reward_extra_info,
+                batch_size=len(scores),
+                prior_size=prior_sample_count,
+            )
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -858,8 +865,8 @@ class RayPPOTrainer:
         reward_extra_infos_dict = {}
         all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
         for key in all_keys:
-            list_a = result_a["reward_extra_infos_dict"].get(key, [])
-            list_b = result_b["reward_extra_infos_dict"].get(key, [])
+            list_a = result_a["reward_extra_infos_dict"].get(key, [None] * len(result_a["sample_uids"]))
+            list_b = result_b["reward_extra_infos_dict"].get(key, [None] * len(result_b["sample_uids"]))
             reward_extra_infos_dict[key] = list_a + list_b
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
@@ -1093,8 +1100,22 @@ class RayPPOTrainer:
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
 
+        checkpoint_async_save = bool(self.config.actor_rollout_ref.actor.checkpoint.get("async_save", False))
+        centralized_local_retention = (
+            not checkpoint_async_save
+            and self.config.trainer.default_hdfs_dir is None
+            and (
+                (max_actor_ckpt_to_keep is not None and max_actor_ckpt_to_keep > 0)
+                or (self.use_critic and max_critic_ckpt_to_keep is not None and max_critic_ckpt_to_keep > 0)
+            )
+        )
+
+        # On a shared filesystem, every distributed worker deleting the same old
+        # directory is racy. Synchronous local saves are rotated once by this
+        # controller after the complete global-step checkpoint is durable.
+        actor_worker_retention = None if centralized_local_retention else max_actor_ckpt_to_keep
         self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=actor_worker_retention
         )
 
         if self.use_critic:
@@ -1106,8 +1127,9 @@ class RayPPOTrainer:
                     self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", str(Role.Critic)
                 )
             )
+            critic_worker_retention = None if centralized_local_retention else max_critic_ckpt_to_keep
             self.critic_wg.save_checkpoint(
-                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=critic_worker_retention
             )
 
         # save dataloader
@@ -1117,20 +1139,36 @@ class RayPPOTrainer:
         torch.save(dataloader_state_dict, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
-        if (
-            hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
-            and self.config.actor_rollout_ref.actor.checkpoint.async_save
-        ) or (
-            "async_save" in self.config.actor_rollout_ref.actor.checkpoint
-            and self.config.actor_rollout_ref.actor.checkpoint["async_save"]
-        ):
+        if checkpoint_async_save:
             print("skip write latest_checkpointed_iteration.txt when async_save is True")
             return
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
-        with open(local_latest_checkpointed_iteration, "w") as f:
+        tracker_tmp_path = f"{local_latest_checkpointed_iteration}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        with open(tracker_tmp_path, "w") as f:
             f.write(str(self.global_steps))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tracker_tmp_path, local_latest_checkpointed_iteration)
+
+        if centralized_local_retention:
+            retention_limits = [
+                limit
+                for limit in (max_actor_ckpt_to_keep, max_critic_ckpt_to_keep if self.use_critic else None)
+                if limit is not None and limit > 0
+            ]
+            max_global_ckpt_to_keep = max(retention_limits)
+            deleted_paths = cleanup_local_global_step_checkpoints(
+                self.config.trainer.default_local_dir,
+                self.global_steps,
+                max_global_ckpt_to_keep,
+            )
+            if deleted_paths:
+                print(
+                    f"Checkpoint retention kept the latest {max_global_ckpt_to_keep} checkpoint(s) "
+                    f"and deleted: {deleted_paths}"
+                )
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":

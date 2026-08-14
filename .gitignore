@@ -131,3 +131,10 @@ logs
 log
 outputs
 .history
+
+# large local experiment artifacts (analysis outputs, datasets, tensorboard, backups)
+low_precision/experiment_analysis/
+low_precision/backups/
+low_precision/.sii/
+tensorboard_log/
+/data/

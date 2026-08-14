@@ -13,6 +13,14 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
+# Keep each async Ray reward actor bounded. With 128 workers on four nodes,
+# concurrency=1 gives 32 simultaneous code evaluators per node and leaves CPU
+# headroom for Ray, Megatron offload, and data processing.
+export VERL_REWARD_WORKER_MAX_CONCURRENCY=${VERL_REWARD_WORKER_MAX_CONCURRENCY:-1}
+# Bound each forked LiveCodeBench evaluator independently. This is an
+# additional-memory budget on top of the child process's inherited mappings.
+export VERL_CODE_EVAL_MAX_MEMORY_GB=${VERL_CODE_EVAL_MAX_MEMORY_GB:-16}
+export DAPO_TASK_RUNNER_NUM_CPUS=${DAPO_TASK_RUNNER_NUM_CPUS:-64}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
 export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
 export WANDB_MODE=${WANDB_MODE:-online}
@@ -20,7 +28,7 @@ export NVTE_FP8_BLOCK_SCALING_FP32_SCALES=${NVTE_FP8_BLOCK_SCALING_FP32_SCALES:-
 
 run_timestamp=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
 project_name=${PROJECT_NAME:-router drift control}
-exp_name_base=${EXPERIMENT_NAME_BASE:-GRPO-DEEPSCALER-Qwen3-30B-A3B-base-MEGATRON-VLLM-FP8-overlap-mismatch-threshold0.045RS-16K}
+exp_name_base=${EXPERIMENT_NAME_BASE:-coding-usage-l1-lengthbucket-top8RS-TIS-C2-32K}
 exp_name=${EXPERIMENT_NAME:-${exp_name_base}_${run_timestamp}}
 trainer_logger=${TRAINER_LOGGER:-'["console","tensorboard","wandb"]'}
 
@@ -35,22 +43,27 @@ kl_loss_type=${KL_LOSS_TYPE:-low_var_kl}
 clip_ratio_low=0.2
 clip_ratio_high=0.27
 
-rollout_is=null
-rollout_is_threshold=null
+rollout_is=token
+rollout_is_threshold=2.0
 rollout_is_batch_normalize=false
 rollout_rs=null
 rollout_rs_threshold=null
 
 enable_rollout_routing_replay=${ENABLE_ROLLOUT_ROUTING_REPLAY:-False}
 enable_router_mismatch_rs=${ENABLE_ROUTER_MISMATCH_RS:-True}
-router_mismatch_rs_threshold=${ROUTER_MISMATCH_RS_THRESHOLD:-0.045}
-router_mismatch_rs_mode=${ROUTER_MISMATCH_RS_MODE:-threshold}
-router_mismatch_rs_fraction=${ROUTER_MISMATCH_RS_FRACTION:-0.0}
-router_mismatch_metric_mode=${ROUTER_MISMATCH_METRIC_MODE:-overlap_fraction}
+router_mismatch_rs_threshold=${ROUTER_MISMATCH_RS_THRESHOLD:-0.0}
+router_mismatch_rs_mode=${ROUTER_MISMATCH_RS_MODE:-length_bucket_top_fraction}
+router_mismatch_rs_fraction=${ROUTER_MISMATCH_RS_FRACTION:-0.08}
+router_mismatch_rs_length_bucket_edges=${ROUTER_MISMATCH_RS_LENGTH_BUCKET_EDGES:-"[2048,4096,8192,12288,16384,24576,32000]"}
+router_mismatch_metric_mode=${ROUTER_MISMATCH_METRIC_MODE:-expert_usage_l1}
 router_mismatch_alignment_warmup_steps=${ROUTER_MISMATCH_ALIGNMENT_WARMUP_STEPS:-1}
+router_expert_usage_smoothing_tau=${ROUTER_EXPERT_USAGE_SMOOTHING_TAU:-4096.0}
+router_expert_usage_num_experts=${ROUTER_EXPERT_USAGE_NUM_EXPERTS:-null}
 
-max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
-max_response_length=${MAX_RESPONSE_LENGTH:-$((16 * 1024))}
+max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
+max_response_length=${MAX_RESPONSE_LENGTH:-32000}
+val_max_response_length=${VAL_MAX_RESPONSE_LENGTH:-32768}
+rollout_max_model_len=$((max_prompt_length + val_max_response_length))
 enable_overlong_buffer=False
 overlong_buffer_len=512
 overlong_penalty_factor=1.0
@@ -69,11 +82,11 @@ WORKING_DIR=${WORKING_DIR:-"/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/ve
 RECIPE_DIR=${RECIPE_DIR:-"${WORKING_DIR}"}
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/inspire/hdd/project/qianghuaxuexi/public"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B-Base"}
 CKPTS_DIR=${CKPTS_DIR:-"/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/ckpts/${project_name}/${exp_name}"}
 export VERL_REWARD_DEBUG_DIR=${VERL_REWARD_DEBUG_DIR:-"${CKPTS_DIR}/reward_debug"}
-export VERL_REWARD_DEBUG_STEPS=${VERL_REWARD_DEBUG_STEPS:-40}
-export VERL_REWARD_DEBUG_SAMPLES=${VERL_REWARD_DEBUG_SAMPLES:-16}
+export VERL_REWARD_DEBUG_STEPS=${VERL_REWARD_DEBUG_STEPS:-0}
+export VERL_REWARD_DEBUG_SAMPLES=${VERL_REWARD_DEBUG_SAMPLES:-0}
 export VERL_PERF_DEBUG_DIR=${VERL_PERF_DEBUG_DIR:-"${CKPTS_DIR}/perf_debug"}
 export VERL_ROUTER_ANALYSIS_DUMP_DIR=${VERL_ROUTER_ANALYSIS_DUMP_DIR:-"${CKPTS_DIR}/router_analysis_dump"}
 export VERL_ROUTER_ANALYSIS_DUMP_MODE=${VERL_ROUTER_ANALYSIS_DUMP_MODE:-tokens}
@@ -82,18 +95,11 @@ export VERL_ROUTER_ANALYSIS_DUMP_STEPS=${VERL_ROUTER_ANALYSIS_DUMP_STEPS:-0}
 export VERL_ROUTER_ANALYSIS_DUMP_SAMPLES=${VERL_ROUTER_ANALYSIS_DUMP_SAMPLES:-16}
 export VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE=${VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE:-float16}
 export VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS=${VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS:-32}
-GSM8K_DIR=${GSM8K_DIR:-"${RAY_DATA_HOME}/datasets/gsm8k"}
-DEEPSCALER_DIR=${DEEPSCALER_DIR:-"${RAY_DATA_HOME}/datasets/deepscaler"}
-TRAIN_FILE=${TRAIN_FILE:-"${DEEPSCALER_DIR}/train.parquet"}
-AIME24_FILE=${AIME24_FILE:-"${RAY_DATA_HOME}/datasets/aime_2024/test.parquet"}
-AIME24_25_FILE=${AIME24_25_FILE:-"${RAY_DATA_HOME}/datasets/aime_2024/aime24_aime25_x32.parquet"}
-MATH500_FILE=${MATH500_FILE:-"${WORKING_DIR}/data/math500/test.parquet"}
-MATH_BENCHMARK_FILE=${MATH_BENCHMARK_FILE:-"${WORKING_DIR}/data/math500/aime24_aime25_x32_math500.parquet"}
-ZEBRALOGIC_FILE=${ZEBRALOGIC_FILE:-"${WORKING_DIR}/data/zebra_logic/test.parquet"}
-FULL_BENCHMARK_FILE=${FULL_BENCHMARK_FILE:-"${WORKING_DIR}/data/zebra_logic/math_and_zebralogic.parquet"}
-TEST_FILE=${TEST_FILE:-"${FULL_BENCHMARK_FILE}"}
+CODING_DATA_DIR=${CODING_DATA_DIR:-"${WORKING_DIR}/data/deepcoder_lcb"}
+TRAIN_FILE=${TRAIN_FILE:-"${CODING_DATA_DIR}/train.parquet"}
+TEST_FILE=${TEST_FILE:-"${CODING_DATA_DIR}/test.parquet"}
 
-NNODES=${PET_NNODES:-${NNODES:-2}}
+NNODES=${PET_NNODES:-${NNODES:-4}}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 NODE_RANK=${PET_NODE_RANK:-${NODE_RANK:-0}}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
@@ -107,10 +113,21 @@ top_p=1.0
 top_k=-1
 val_top_p=${VAL_TOP_P:-0.95}
 val_top_k=${VAL_TOP_K:-20}
+val_batch_size=${VAL_BATCH_SIZE:-32}
+reward_num_workers=${REWARD_NUM_WORKERS:-128}
 
 use_dynamic_bsz=True
-actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
-infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
+single_sequence_max_token_len=$((max_prompt_length + max_response_length))
+actor_ppo_max_token_len=${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-65536}
+infer_ppo_max_token_len=${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-65536}
+if (( actor_ppo_max_token_len < single_sequence_max_token_len )); then
+    echo "ERROR: ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU=${actor_ppo_max_token_len} is smaller than one maximum training sequence (${single_sequence_max_token_len})." >&2
+    exit 1
+fi
+if (( infer_ppo_max_token_len < single_sequence_max_token_len )); then
+    echo "ERROR: LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${infer_ppo_max_token_len} is smaller than one maximum training sequence (${single_sequence_max_token_len})." >&2
+    exit 1
+fi
 actor_lr=${ACTOR_LR:-3e-6}
 offload=${OFFLOAD:-true}
 
@@ -122,15 +139,49 @@ train_etp=${TRAIN_ETP:-2}
 
 gen_tp=${GEN_TP:-2}
 rollout_gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.85}
-rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
-rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-128}
+rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-131072}
+# 32 H200s with rollout TP=2 create 16 replicas. A cap of 64 gives 1024
+# concurrent sequences, so the default 256x8 rollout batch is two even waves.
+rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
 rollout_enforce_eager=${ROLLOUT_ENFORCE_EAGER:-True}
 rollout_compilation_mode=${ROLLOUT_COMPILATION_MODE:-NONE}
 rollout_cudagraph_mode=${ROLLOUT_CUDAGRAPH_MODE:-NONE}
-val_before_train=${VAL_BEFORE_TRAIN:-True}
+val_before_train=${VAL_BEFORE_TRAIN:-False}
 test_freq=${TEST_FREQ:-10}
 save_freq=${SAVE_FREQ:-50}
 total_training_steps=${TOTAL_TRAINING_STEPS:-500}
+
+total_gpus=$((NNODES * NGPUS_PER_NODE))
+train_model_parallel_size=$((train_tp * train_pp))
+if (( total_gpus % train_model_parallel_size != 0 )); then
+    echo "ERROR: ${total_gpus} GPUs is not divisible by train TP*PP=${train_model_parallel_size}." >&2
+    exit 1
+fi
+if (( total_gpus % gen_tp != 0 )); then
+    echo "ERROR: ${total_gpus} GPUs is not divisible by rollout TP=${gen_tp}." >&2
+    exit 1
+fi
+train_dp=$((total_gpus / train_model_parallel_size))
+rollout_replicas=$((total_gpus / gen_tp))
+
+if [[ ! "${VERL_REWARD_WORKER_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: VERL_REWARD_WORKER_MAX_CONCURRENCY must be a positive integer; 0 would remove OOM backpressure." >&2
+    exit 1
+fi
+if [[ ! "${VERL_CODE_EVAL_MAX_MEMORY_GB}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: VERL_CODE_EVAL_MAX_MEMORY_GB must be a positive integer." >&2
+    exit 1
+fi
+if (( rollout_max_num_seqs <= 0 )); then
+    echo "ERROR: ROLLOUT_MAX_NUM_SEQS must be positive." >&2
+    exit 1
+fi
+
+rollout_total_sequences=$((gen_prompt_bsz * n_resp_per_prompt))
+rollout_cluster_capacity=$((rollout_replicas * rollout_max_num_seqs))
+rollout_estimated_waves=$(((rollout_total_sequences + rollout_cluster_capacity - 1) / rollout_cluster_capacity))
+reward_workers_per_node=$(((reward_num_workers + NNODES - 1) / NNODES))
+reward_concurrency_per_node=$((reward_workers_per_node * VERL_REWARD_WORKER_MAX_CONCURRENCY))
 
 export PYTHONPATH="${WORKING_DIR}:${RECIPE_DIR}:${PYTHONPATH:-}"
 export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-INFO}
@@ -147,20 +198,27 @@ export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export TORCH_NCCL_AVOID_RECORD_STREAMS=${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}
 
 cd "${WORKING_DIR}"
+for data_file in "${TRAIN_FILE}" "${TEST_FILE}"; do
+    if [ ! -s "${data_file}" ]; then
+        echo "ERROR: Missing coding dataset: ${data_file}" >&2
+        echo "Run: python3 examples/data_preprocess/deepcoder_lcb.py --local-dir ${CODING_DATA_DIR}" >&2
+        exit 1
+    fi
+done
 mkdir -p "${CKPTS_DIR}" "${CKPTS_DIR}/run_logs"
 
 TRAINING_CMD=(
     python3 -m dapo.main_dapo
-    --config-name=dapo_megatron_trainer
+    --config-name=dapo_coding_megatron_trainer
     data.train_files="${TRAIN_FILE}"
     data.val_files="${TEST_FILE}"
     data.prompt_key=prompt
-    data.truncation=left
+    data.truncation=right
     data.return_raw_chat=True
-    +data.apply_chat_template_kwargs.enable_thinking=false
     data.filter_overlong_prompts=True
     data.max_prompt_length=${max_prompt_length}
     data.max_response_length=${max_response_length}
+    data.val_batch_size=${val_batch_size}
     data.train_batch_size=${train_prompt_bsz}
     data.gen_batch_size=${gen_prompt_bsz}
     actor_rollout_ref.nccl_timeout=1800
@@ -181,8 +239,11 @@ TRAINING_CMD=(
     router.mismatch_rs_threshold=${router_mismatch_rs_threshold}
     router.mismatch_rs_mode=${router_mismatch_rs_mode}
     router.mismatch_rs_fraction=${router_mismatch_rs_fraction}
+    router.mismatch_rs_length_bucket_edges=${router_mismatch_rs_length_bucket_edges}
     router.mismatch_metric_mode=${router_mismatch_metric_mode}
     router.mismatch_alignment_warmup_steps=${router_mismatch_alignment_warmup_steps}
+    router.expert_usage_smoothing_tau=${router_expert_usage_smoothing_tau}
+    router.expert_usage_num_experts=${router_expert_usage_num_experts}
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss}
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef}
     actor_rollout_ref.actor.kl_loss_type=${kl_loss_type}
@@ -225,6 +286,7 @@ TRAINING_CMD=(
     actor_rollout_ref.rollout.enable_chunked_prefill=True
     actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens}
     actor_rollout_ref.rollout.max_num_seqs=${rollout_max_num_seqs}
+    actor_rollout_ref.rollout.max_model_len=${rollout_max_model_len}
     actor_rollout_ref.rollout.temperature=${temperature}
     actor_rollout_ref.rollout.top_p=${top_p}
     actor_rollout_ref.rollout.top_k=${top_k}
@@ -233,6 +295,7 @@ TRAINING_CMD=(
     actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k}
     actor_rollout_ref.rollout.val_kwargs.do_sample=True
     actor_rollout_ref.rollout.val_kwargs.n=1
+    actor_rollout_ref.rollout.val_kwargs.max_response_length=${val_max_response_length}
     +actor_rollout_ref.rollout.quantization=fp8
     actor_rollout_ref.rollout.name=vllm
     actor_rollout_ref.rollout.mode=async
@@ -248,6 +311,7 @@ TRAINING_CMD=(
     actor_rollout_ref.ref.megatron.use_remove_padding=True
     actor_rollout_ref.ref.megatron.dtype=bfloat16
     reward.reward_manager.name=dapo
+    reward.num_workers=${reward_num_workers}
     reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer}
     reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len}
     reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor}
@@ -272,6 +336,8 @@ TRAINING_CMD=(
     +trainer.use_legacy_worker_impl=disable
     actor_rollout_ref.rollout.enforce_eager=${rollout_enforce_eager}
     +ray_kwargs.ray_init.address=auto
+    "+ray_kwargs.ray_init.runtime_env.env_vars.VERL_REWARD_WORKER_MAX_CONCURRENCY=\"${VERL_REWARD_WORKER_MAX_CONCURRENCY}\""
+    "+ray_kwargs.ray_init.runtime_env.env_vars.VERL_CODE_EVAL_MAX_MEMORY_GB=\"${VERL_CODE_EVAL_MAX_MEMORY_GB}\""
 )
 
 start_ray_cluster() {
@@ -392,20 +458,35 @@ main() {
     export GLOO_SOCKET_TIMEOUT=${GLOO_SOCKET_TIMEOUT:-600}
     export GLOO_TCP_TIMEOUT=${GLOO_TCP_TIMEOUT:-600}
 
-    echo "[GRPO-FP8-BASELINE] model=${MODEL_PATH}"
-    echo "[GRPO-FP8-BASELINE] train=${TRAIN_FILE}"
-    echo "[GRPO-FP8-BASELINE] val=${TEST_FILE}"
-    echo "[GRPO-FP8-BASELINE] project=${project_name} experiment=${exp_name}"
-    echo "[GRPO-FP8-BASELINE] nnodes=${NNODES} node_rank=${NODE_RANK} gpus_per_node=${NGPUS_PER_NODE}"
-    echo "[GRPO-FP8-BASELINE] rollout_routing_replay=${enable_rollout_routing_replay}"
+    echo "[CODING-GRPO-FP8] model=${MODEL_PATH}"
+    echo "[CODING-GRPO-FP8] train=${TRAIN_FILE}"
+    echo "[CODING-GRPO-FP8] val=${TEST_FILE}"
+    echo "[CODING-GRPO-FP8] train_response=${max_response_length} val_response=${val_max_response_length}"
+    echo "[CODING-GRPO-FP8] project=${project_name} experiment=${exp_name}"
+    echo "[CODING-GRPO-FP8] nnodes=${NNODES} node_rank=${NODE_RANK} gpus_per_node=${NGPUS_PER_NODE}"
+    echo "[CODING-GRPO-FP8] total_gpus=${total_gpus} train_tp=${train_tp} train_pp=${train_pp} train_ep=${train_ep} train_etp=${train_etp} train_dp=${train_dp}"
+    echo "[CODING-GRPO-FP8] rollout_tp=${gen_tp} rollout_replicas=${rollout_replicas} max_num_seqs=${rollout_max_num_seqs}"
+    echo "[CODING-GRPO-FP8] rollout_total_sequences=${rollout_total_sequences} cluster_sequence_capacity=${rollout_cluster_capacity} estimated_waves=${rollout_estimated_waves}"
+    echo "[CODING-GRPO-FP8] reward_workers=${reward_num_workers} reward_worker_max_concurrency=${VERL_REWARD_WORKER_MAX_CONCURRENCY}"
+    echo "[CODING-GRPO-FP8] reward_workers_per_node~=${reward_workers_per_node} reward_concurrency_per_node~=${reward_concurrency_per_node}"
+    echo "[CODING-GRPO-FP8] code_eval_additional_memory_limit_gib=${VERL_CODE_EVAL_MAX_MEMORY_GB}"
+    echo "[CODING-GRPO-FP8] actor_max_tokens_per_gpu=${actor_ppo_max_token_len} logprob_max_tokens_per_gpu=${infer_ppo_max_token_len} task_runner_cpus=${DAPO_TASK_RUNNER_NUM_CPUS}"
+    echo "[CODING-GRPO-FP8] rollout_routing_replay=${enable_rollout_routing_replay}"
     echo "INFO: Ray temp dir: ${RAY_TMPDIR}"
+
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        printf 'TRAINING_CMD:'
+        printf ' %q' "${TRAINING_CMD[@]}" "$@"
+        printf '\n'
+        return 0
+    fi
 
     ray stop --force >/dev/null 2>&1 || true
     start_ray_cluster
     wait_for_ray_nodes
 
     if [ "${NODE_RANK}" = "0" ]; then
-        echo "INFO: Rank 0 launching GRPO Megatron FP8 rollout baseline training with Ray address ${RAY_ADDRESS}"
+        echo "INFO: Rank 0 launching coding GRPO Megatron FP8 rollout training with Ray address ${RAY_ADDRESS}"
         "${TRAINING_CMD[@]}" "$@"
         echo "INFO: Rank 0 training finished."
         sleep 30

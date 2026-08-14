@@ -3,18 +3,24 @@ set -xeuo pipefail
 
 ulimit -c 0 || true
 
+# math-verify is required by the MATH-500 validation scorer on every node;
+# verl's wrapper silently returns 0.0 if the import fails, so ensure it here.
+python3 -c "import math_verify" 2>/dev/null || pip install --quiet --no-index \
+    --find-links /inspire/hdd/project/qianghuaxuexi/public/wheels math-verify || \
+    echo "WARNING: math-verify install failed; MATH-500 validation scores will be 0"
+
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
-# WANDB_API_KEY is read from the environment or an existing W&B login.
+export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
 export WANDB_MODE=${WANDB_MODE:-online}
 export NVTE_FP8_BLOCK_SCALING_FP32_SCALES=${NVTE_FP8_BLOCK_SCALING_FP32_SCALES:-1}
 
 run_timestamp=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
-project_name=${PROJECT_NAME:-jly-DAPO-DEEPSCALER-FP8-ROLLOUT}
-exp_name_base=${EXPERIMENT_NAME_BASE:-GRPO-DEEPSCALER-Qwen3-30B-A3B-base-MEGATRON-VLLM-FP8-usage-l1-lengthbucket-top8RS-TIS-C2-16K}
+project_name=${PROJECT_NAME:-router drift control}
+exp_name_base=${EXPERIMENT_NAME_BASE:-lengthbucket-top8RS-TIS-SFT}
 exp_name=${EXPERIMENT_NAME:-${exp_name_base}_${run_timestamp}}
 trainer_logger=${TRAINER_LOGGER:-'["console","tensorboard","wandb"]'}
 
@@ -22,8 +28,8 @@ adv_estimator=grpo
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=True
-kl_loss_coef=${KL_LOSS_COEF:-0.001}
+use_kl_loss=${USE_KL_LOSS:-False}
+kl_loss_coef=${KL_LOSS_COEF:-0.0}
 kl_loss_type=${KL_LOSS_TYPE:-low_var_kl}
 
 clip_ratio_low=0.2
@@ -47,15 +53,25 @@ router_expert_usage_smoothing_tau=${ROUTER_EXPERT_USAGE_SMOOTHING_TAU:-4096.0}
 router_expert_usage_num_experts=${ROUTER_EXPERT_USAGE_NUM_EXPERTS:-null}
 
 max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
-max_response_length=${MAX_RESPONSE_LENGTH:-$((16 * 1024))}
+# Training generation budget. 20480 follows the original DAPO recipe
+# (R3 uses 30720 = the max that fits base's 32768 context with 2048 prompt).
+max_response_length=${MAX_RESPONSE_LENGTH:-$((20 * 1024))}
+# Validation-only generation budget (decoupled from training length via
+# rollout.val_kwargs.max_response_length). Qwen3-30B-A3B has
+# max_position_embeddings=32768, so validation caps at 32768-2048=30720.
+val_max_response_length=${VAL_MAX_RESPONSE_LENGTH:-30720}
+rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-32768}
 enable_overlong_buffer=False
 overlong_buffer_len=512
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
-enable_filter_groups=False
+enable_filter_groups=${ENABLE_FILTER_GROUPS:-True}
 filter_groups_metric=acc
+# 0 = unlimited resampling rounds. Base model cold-start on DAPO-17k yields
+# <10% mixed-outcome groups at step 1, which exceeded a cap of 10 (observed
+# 2026-07-30); expect 2-4h per step early on, decaying as the model improves.
 max_num_gen_batches=${MAX_NUM_GEN_BATCHES:-0}
 train_prompt_bsz=${TRAIN_PROMPT_BSZ:-256}
 n_resp_per_prompt=${N_RESP_PER_PROMPT:-8}
@@ -74,17 +90,22 @@ export VERL_REWARD_DEBUG_SAMPLES=${VERL_REWARD_DEBUG_SAMPLES:-16}
 export VERL_PERF_DEBUG_DIR=${VERL_PERF_DEBUG_DIR:-"${CKPTS_DIR}/perf_debug"}
 export VERL_ROUTER_ANALYSIS_DUMP_DIR=${VERL_ROUTER_ANALYSIS_DUMP_DIR:-"${CKPTS_DIR}/router_analysis_dump"}
 export VERL_ROUTER_ANALYSIS_DUMP_MODE=${VERL_ROUTER_ANALYSIS_DUMP_MODE:-tokens}
-export VERL_ROUTER_ANALYSIS_DUMP_EVERY_N=${VERL_ROUTER_ANALYSIS_DUMP_EVERY_N:-1}
+export VERL_ROUTER_ANALYSIS_DUMP_EVERY_N=${VERL_ROUTER_ANALYSIS_DUMP_EVERY_N:-5}
 export VERL_ROUTER_ANALYSIS_DUMP_STEPS=${VERL_ROUTER_ANALYSIS_DUMP_STEPS:-0}
 export VERL_ROUTER_ANALYSIS_DUMP_SAMPLES=${VERL_ROUTER_ANALYSIS_DUMP_SAMPLES:-16}
 export VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE=${VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE:-float16}
 export VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS=${VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS:-32}
 GSM8K_DIR=${GSM8K_DIR:-"${RAY_DATA_HOME}/datasets/gsm8k"}
 DEEPSCALER_DIR=${DEEPSCALER_DIR:-"${RAY_DATA_HOME}/datasets/deepscaler"}
-TRAIN_FILE=${TRAIN_FILE:-"${DEEPSCALER_DIR}/train.parquet"}
+DAPO_MATH_17K_FILE=${DAPO_MATH_17K_FILE:-"${RAY_DATA_HOME}/datasets/DAPO-Math-17k/dapo-math-17k.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${DAPO_MATH_17K_FILE}"}
 AIME24_FILE=${AIME24_FILE:-"${RAY_DATA_HOME}/datasets/aime_2024/test.parquet"}
 AIME24_25_FILE=${AIME24_25_FILE:-"${RAY_DATA_HOME}/datasets/aime_2024/aime24_aime25_x32.parquet"}
-TEST_FILE=${TEST_FILE:-"${AIME24_25_FILE}"}
+MATH500_FILE=${MATH500_FILE:-"${WORKING_DIR}/data/math500/test.parquet"}
+MATH_BENCHMARK_FILE=${MATH_BENCHMARK_FILE:-"${WORKING_DIR}/data/math500/aime24_aime25_x32_math500.parquet"}
+ZEBRALOGIC_FILE=${ZEBRALOGIC_FILE:-"${WORKING_DIR}/data/zebra_logic/test.parquet"}
+FULL_BENCHMARK_FILE=${FULL_BENCHMARK_FILE:-"${WORKING_DIR}/data/zebra_logic/math_and_zebralogic.parquet"}
+TEST_FILE=${TEST_FILE:-"${FULL_BENCHMARK_FILE}"}
 
 NNODES=${PET_NNODES:-${NNODES:-2}}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
@@ -98,6 +119,8 @@ RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
 temperature=1.0
 top_p=1.0
 top_k=-1
+val_top_p=${VAL_TOP_P:-0.95}
+val_top_k=${VAL_TOP_K:-20}
 
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
@@ -119,8 +142,8 @@ rollout_enforce_eager=${ROLLOUT_ENFORCE_EAGER:-True}
 rollout_compilation_mode=${ROLLOUT_COMPILATION_MODE:-NONE}
 rollout_cudagraph_mode=${ROLLOUT_CUDAGRAPH_MODE:-NONE}
 val_before_train=${VAL_BEFORE_TRAIN:-True}
-test_freq=${TEST_FREQ:-10}
-save_freq=${SAVE_FREQ:-20}
+test_freq=${TEST_FREQ:-5}
+save_freq=${SAVE_FREQ:-30}
 total_training_steps=${TOTAL_TRAINING_STEPS:-500}
 
 export PYTHONPATH="${WORKING_DIR}:${RECIPE_DIR}:${PYTHONPATH:-}"
@@ -148,6 +171,7 @@ TRAINING_CMD=(
     data.prompt_key=prompt
     data.truncation=left
     data.return_raw_chat=True
+    +data.apply_chat_template_kwargs.enable_thinking=false
     data.filter_overlong_prompts=True
     data.max_prompt_length=${max_prompt_length}
     data.max_response_length=${max_response_length}
@@ -222,10 +246,12 @@ TRAINING_CMD=(
     actor_rollout_ref.rollout.top_p=${top_p}
     actor_rollout_ref.rollout.top_k=${top_k}
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6
-    actor_rollout_ref.rollout.val_kwargs.top_p=${top_p}
-    actor_rollout_ref.rollout.val_kwargs.top_k=${top_k}
+    actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p}
+    actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k}
     actor_rollout_ref.rollout.val_kwargs.do_sample=True
     actor_rollout_ref.rollout.val_kwargs.n=1
+    actor_rollout_ref.rollout.val_kwargs.max_response_length=${val_max_response_length}
+    actor_rollout_ref.rollout.max_model_len=${rollout_max_model_len}
     +actor_rollout_ref.rollout.quantization=fp8
     actor_rollout_ref.rollout.name=vllm
     actor_rollout_ref.rollout.mode=async

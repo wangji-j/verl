@@ -3,17 +3,23 @@ set -xeuo pipefail
 
 ulimit -c 0 || true
 
+# math-verify is required by the MATH-500 validation scorer on every node;
+# verl's wrapper silently returns 0.0 if the import fails, so ensure it here.
+python3 -c "import math_verify" 2>/dev/null || pip install --quiet --no-index \
+    --find-links /inspire/hdd/project/qianghuaxuexi/public/wheels math-verify || \
+    echo "WARNING: math-verify install failed; MATH-500 validation scores will be 0"
+
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
-# WANDB_API_KEY is read from the environment or an existing W&B login.
+export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
 export WANDB_MODE=${WANDB_MODE:-online}
 export NVTE_FP8_BLOCK_SCALING_FP32_SCALES=${NVTE_FP8_BLOCK_SCALING_FP32_SCALES:-1}
 
 run_timestamp=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}
-project_name=${PROJECT_NAME:-jly-DAPO-DEEPSCALER-FP8-ROLLOUT}
+project_name=${PROJECT_NAME:-router drift control}
 exp_name_base=${EXPERIMENT_NAME_BASE:-GRPO-DEEPSCALER-Qwen3-30B-A3B-base-MEGATRON-VLLM-FP8-usage-l1-top8RS-16K}
 exp_name=${EXPERIMENT_NAME:-${exp_name_base}_${run_timestamp}}
 trainer_logger=${TRAINER_LOGGER:-'["console","tensorboard","wandb"]'}
@@ -73,7 +79,7 @@ export VERL_REWARD_DEBUG_SAMPLES=${VERL_REWARD_DEBUG_SAMPLES:-16}
 export VERL_PERF_DEBUG_DIR=${VERL_PERF_DEBUG_DIR:-"${CKPTS_DIR}/perf_debug"}
 export VERL_ROUTER_ANALYSIS_DUMP_DIR=${VERL_ROUTER_ANALYSIS_DUMP_DIR:-"${CKPTS_DIR}/router_analysis_dump"}
 export VERL_ROUTER_ANALYSIS_DUMP_MODE=${VERL_ROUTER_ANALYSIS_DUMP_MODE:-tokens}
-export VERL_ROUTER_ANALYSIS_DUMP_EVERY_N=${VERL_ROUTER_ANALYSIS_DUMP_EVERY_N:-1}
+export VERL_ROUTER_ANALYSIS_DUMP_EVERY_N=${VERL_ROUTER_ANALYSIS_DUMP_EVERY_N:-5}
 export VERL_ROUTER_ANALYSIS_DUMP_STEPS=${VERL_ROUTER_ANALYSIS_DUMP_STEPS:-0}
 export VERL_ROUTER_ANALYSIS_DUMP_SAMPLES=${VERL_ROUTER_ANALYSIS_DUMP_SAMPLES:-16}
 export VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE=${VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE:-float16}
@@ -83,7 +89,11 @@ DEEPSCALER_DIR=${DEEPSCALER_DIR:-"${RAY_DATA_HOME}/datasets/deepscaler"}
 TRAIN_FILE=${TRAIN_FILE:-"${DEEPSCALER_DIR}/train.parquet"}
 AIME24_FILE=${AIME24_FILE:-"${RAY_DATA_HOME}/datasets/aime_2024/test.parquet"}
 AIME24_25_FILE=${AIME24_25_FILE:-"${RAY_DATA_HOME}/datasets/aime_2024/aime24_aime25_x32.parquet"}
-TEST_FILE=${TEST_FILE:-"${AIME24_25_FILE}"}
+MATH500_FILE=${MATH500_FILE:-"${WORKING_DIR}/data/math500/test.parquet"}
+MATH_BENCHMARK_FILE=${MATH_BENCHMARK_FILE:-"${WORKING_DIR}/data/math500/aime24_aime25_x32_math500.parquet"}
+ZEBRALOGIC_FILE=${ZEBRALOGIC_FILE:-"${WORKING_DIR}/data/zebra_logic/test.parquet"}
+FULL_BENCHMARK_FILE=${FULL_BENCHMARK_FILE:-"${WORKING_DIR}/data/zebra_logic/math_and_zebralogic.parquet"}
+TEST_FILE=${TEST_FILE:-"${FULL_BENCHMARK_FILE}"}
 
 NNODES=${PET_NNODES:-${NNODES:-2}}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
@@ -97,6 +107,8 @@ RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
 temperature=1.0
 top_p=1.0
 top_k=-1
+val_top_p=${VAL_TOP_P:-0.95}
+val_top_k=${VAL_TOP_K:-20}
 
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
@@ -119,7 +131,7 @@ rollout_compilation_mode=${ROLLOUT_COMPILATION_MODE:-NONE}
 rollout_cudagraph_mode=${ROLLOUT_CUDAGRAPH_MODE:-NONE}
 val_before_train=${VAL_BEFORE_TRAIN:-True}
 test_freq=${TEST_FREQ:-10}
-save_freq=${SAVE_FREQ:-20}
+save_freq=${SAVE_FREQ:-50}
 total_training_steps=${TOTAL_TRAINING_STEPS:-500}
 
 export PYTHONPATH="${WORKING_DIR}:${RECIPE_DIR}:${PYTHONPATH:-}"
@@ -147,6 +159,7 @@ TRAINING_CMD=(
     data.prompt_key=prompt
     data.truncation=left
     data.return_raw_chat=True
+    +data.apply_chat_template_kwargs.enable_thinking=false
     data.filter_overlong_prompts=True
     data.max_prompt_length=${max_prompt_length}
     data.max_response_length=${max_response_length}
@@ -220,8 +233,8 @@ TRAINING_CMD=(
     actor_rollout_ref.rollout.top_p=${top_p}
     actor_rollout_ref.rollout.top_k=${top_k}
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6
-    actor_rollout_ref.rollout.val_kwargs.top_p=${top_p}
-    actor_rollout_ref.rollout.val_kwargs.top_k=${top_k}
+    actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p}
+    actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k}
     actor_rollout_ref.rollout.val_kwargs.do_sample=True
     actor_rollout_ref.rollout.val_kwargs.n=1
     +actor_rollout_ref.rollout.quantization=fp8

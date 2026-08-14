@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
+export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
+
 # need cuda12.9 or higher
 # use docker://verlai/verl:dev.vllm_nightly-243ed7d32e94f00a9a32fbbc51be932f6277a55d or self build
 # pip install --no-deps git+https://github.com/NVIDIA-NeMo/Megatron-Bridge@v0.3.0
@@ -15,7 +18,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 NNODES=${NNODES:-3}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${PWD}"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/hf_models/Qwen3-30B-A3B-Base"}
+MODEL_PATH=${MODEL_PATH:-"/inspire/hdd/project/qianghuaxuexi/public/models/Qwen3-30B-A3B-Base"}
 project_name=${project_name:-"DAPO_async_fp8rollout"}
 exp_name=${exp_name:-"${ID}"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpt/${project_name}/${exp_name}"}
@@ -93,7 +96,7 @@ RAY_ADDRESS=$RAY_ADDRESS ray job submit --runtime-env="${RUNTIME_ENV}" \
     trainer.max_critic_ckpt_to_keep=1 \
     trainer.total_epochs=1 \
     trainer.val_before_train=True \
-    trainer.save_freq=20 \
+    trainer.save_freq=50 \
     trainer.resume_mode=auto \
     trainer.nnodes="${NNODES_TRAIN}" \
     trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \

@@ -251,6 +251,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         epochs = tu.pop(data, key="epochs", default=1)
         seed = tu.pop(data, key="seed", default=42)
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+        update_lr_scheduler_at_end = tu.pop(data, key="update_lr_scheduler_at_end", default=True)
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
@@ -298,7 +299,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 tu.assign_non_tensor(
                     mini_batch_td,
                     global_token_num=NonTensorData(global_token_num),
-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
+                    update_lr_scheduler=update_lr_scheduler_at_end and batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
                 actor_output = self.train_batch(mini_batch_td)
