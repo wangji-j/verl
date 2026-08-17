@@ -1,0 +1,1 @@
+{"global_step": 4, "debug_name": "old_log_prob_forward", "duration_s": 60.65339914301876, "batch_size": 2048, "responses_shape": [2048, 20480], "response_mask_tokens": 3691777, "returned_keys": ["old_log_probs", "entropys"], "mfu": 0.02456628947117456}
