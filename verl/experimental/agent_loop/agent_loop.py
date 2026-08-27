@@ -972,7 +972,13 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        if inputs[0].routed_experts is not None:
+        # Require ALL samples to carry routed_experts before concatenating: a
+        # single None (e.g. a generation aborted at a weight-sync boundary when
+        # partial_rollout is off) would otherwise make torch.cat raise
+        # "expected Tensor ... but got NoneType". Dropping routes for the whole
+        # group degrades gracefully (RDC/replay simply skip it) instead of
+        # crashing the rollouter.
+        if all(inp.routed_experts is not None for inp in inputs):
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)

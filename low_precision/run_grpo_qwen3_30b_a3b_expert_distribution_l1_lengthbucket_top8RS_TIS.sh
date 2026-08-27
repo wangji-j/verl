@@ -67,7 +67,7 @@ overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
-enable_filter_groups=${ENABLE_FILTER_GROUPS:-True}
+enable_filter_groups=${ENABLE_FILTER_GROUPS:-False}
 filter_groups_metric=acc
 # 0 = unlimited resampling rounds. Base model cold-start on DAPO-17k yields
 # <10% mixed-outcome groups at step 1, which exceeded a cap of 10 (observed
@@ -91,7 +91,7 @@ export VERL_PERF_DEBUG_DIR=${VERL_PERF_DEBUG_DIR:-"${CKPTS_DIR}/perf_debug"}
 export VERL_ROUTER_ANALYSIS_DUMP_DIR=${VERL_ROUTER_ANALYSIS_DUMP_DIR:-"${CKPTS_DIR}/router_analysis_dump"}
 export VERL_ROUTER_ANALYSIS_DUMP_MODE=${VERL_ROUTER_ANALYSIS_DUMP_MODE:-tokens}
 export VERL_ROUTER_ANALYSIS_DUMP_EVERY_N=${VERL_ROUTER_ANALYSIS_DUMP_EVERY_N:-5}
-export VERL_ROUTER_ANALYSIS_DUMP_STEPS=${VERL_ROUTER_ANALYSIS_DUMP_STEPS:-0}
+export VERL_ROUTER_ANALYSIS_DUMP_STEPS=${VERL_ROUTER_ANALYSIS_DUMP_STEPS:-150}
 export VERL_ROUTER_ANALYSIS_DUMP_SAMPLES=${VERL_ROUTER_ANALYSIS_DUMP_SAMPLES:-16}
 export VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE=${VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE:-float16}
 export VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS=${VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS:-32}
@@ -122,7 +122,7 @@ top_k=-1
 val_top_p=${VAL_TOP_P:-0.95}
 val_top_k=${VAL_TOP_K:-20}
 
-use_dynamic_bsz=True
+use_dynamic_bsz=False
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 actor_lr=${ACTOR_LR:-3e-6}

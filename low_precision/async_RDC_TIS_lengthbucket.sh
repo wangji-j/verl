@@ -97,13 +97,23 @@ n_resp_per_prompt=${N_RESP_PER_PROMPT:-8}
 train_prompt_bsz=0
 gen_prompt_bsz=1
 train_prompt_mini_bsz=${TRAIN_PROMPT_MINI_BSZ:-32}
-total_rollout_steps=${TOTAL_ROLLOUT_STEPS:-$((32 * 400))}   # gbs * steps
 
 # --- Async / staleness knobs (main things to tune) ---------------------------
 staleness_threshold=${STALENESS_THRESHOLD:-0.5}
 trigger_parameter_sync_step=${TRIGGER_PARAMETER_SYNC_STEP:-4}
 require_batches=${REQUIRE_BATCHES:-1}
 partial_rollout=${PARTIAL_ROLLOUT:-True}
+
+# Training length. The rollouter stops after `total_rollout_steps` SAMPLES; one
+# training step consumes required_samples * trigger_parameter_sync_step =
+# (ppo_mini_batch_size * require_batches) * trigger_parameter_sync_step samples
+# (see fully_async_rollouter.py:669). So specify the desired number of TRAINING
+# steps and derive the sample budget, instead of hand-guessing total_rollout_steps
+# (the old default 32*400 silently became only 100 train steps at trigger=4).
+# TOTAL_ROLLOUT_STEPS still overrides the sample budget directly if preferred.
+total_training_steps=${TOTAL_TRAINING_STEPS:-500}
+samples_per_train_step=$(( train_prompt_mini_bsz * require_batches * trigger_parameter_sync_step ))
+total_rollout_steps=${TOTAL_ROLLOUT_STEPS:-$(( total_training_steps * samples_per_train_step ))}
 
 WORKING_DIR=${WORKING_DIR:-"/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/verl-sequence"}
 RECIPE_DIR=${RECIPE_DIR:-"${WORKING_DIR}"}
