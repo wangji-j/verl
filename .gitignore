@@ -138,3 +138,5 @@ low_precision/backups/
 low_precision/.sii/
 tensorboard_log/
 /data/
+dumps/
+low_precision/record.md
