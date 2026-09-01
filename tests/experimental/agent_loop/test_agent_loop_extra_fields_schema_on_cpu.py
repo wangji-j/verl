@@ -28,10 +28,13 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopWorker,
     DictConfigWrap,
     _InternalAgentLoopOutput,
+    _normalize_reward_extra_info_outputs,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+from verl.protocol import DataProto
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.workers.rollout.replica import TokenOutput
+from verl.workers.config.rollout import RolloutConfig, SamplingConfig
 
 
 class _FakeServerManager:
@@ -135,6 +138,7 @@ def _to_internal(
     num_turns: int,
     prompt_len: int,
     response_len: int,
+    reward_score: Optional[float] = None,
 ) -> _InternalAgentLoopOutput:
     prompt_ids = _pad_1d(output_prompt_ids, length=prompt_len, pad_id=0)
     response_ids = _pad_1d(output_response_ids, length=response_len, pad_id=0)
@@ -163,11 +167,22 @@ def _to_internal(
         routed_experts=None,
         multi_modal_inputs=None,
         multi_modal_data=None,
-        reward_score=None,
+        reward_score=reward_score,
         num_turns=num_turns,
         metrics=metrics,
         extra_fields=extra_fields,
     )
+
+
+def test_validation_response_length_can_differ_from_training_length():
+    worker = object.__new__(AgentLoopWorker)
+    worker.rollout_config = RolloutConfig(
+        response_length=32000,
+        val_kwargs=SamplingConfig(max_response_length=65536),
+    )
+
+    assert worker._effective_response_length(validate=False) == 32000
+    assert worker._effective_response_length(validate=True) == 65536
 
 
 @pytest.mark.asyncio
@@ -254,6 +269,56 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     # And the list-typed fields are actually lists (not missing / scalar).
     assert merged.non_tensor_batch["turn_scores"][0] == []
     assert merged.non_tensor_batch["tool_rewards"][0] == []
+
+
+def test_agent_loop_postprocess_supports_task_specific_reward_metadata_on_cpu():
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {"reward_loop_worker_handles": None, "distillation_enabled": False},
+    )()
+    metrics = AgentLoopMetrics()
+
+    aime = _to_internal(
+        output_prompt_ids=[101],
+        output_response_ids=[11],
+        output_response_mask=[1],
+        metrics=metrics,
+        extra_fields={"reward_extra_info": {"score": 1.0, "acc": 1.0, "pred": "42"}},
+        num_turns=1,
+        prompt_len=2,
+        response_len=2,
+        reward_score=1.0,
+    )
+    zebra = _to_internal(
+        output_prompt_ids=[102],
+        output_response_ids=[12],
+        output_response_mask=[1],
+        metrics=metrics,
+        extra_fields={"reward_extra_info": {"acc": 0.0}},
+        num_turns=1,
+        prompt_len=2,
+        response_len=2,
+        reward_score=0.0,
+    )
+
+    # Mixed schemas inside one worker chunk must preserve all sample positions.
+    mixed = AgentLoopWorker._postprocess(dummy_worker, inputs=[aime, zebra], input_non_tensor_batch={})
+    assert mixed.meta_info["reward_extra_keys"] == ["score", "acc", "pred"]
+    assert mixed.non_tensor_batch["score"].tolist() == [1.0, None]
+    assert mixed.non_tensor_batch["acc"].tolist() == [1.0, 0.0]
+    assert mixed.non_tensor_batch["pred"].tolist() == ["42", None]
+
+    # Worker chunks that each see only one task must also be normalized before concat.
+    aime_chunk = AgentLoopWorker._postprocess(dummy_worker, inputs=[aime], input_non_tensor_batch={})
+    zebra_chunk = AgentLoopWorker._postprocess(dummy_worker, inputs=[zebra], input_non_tensor_batch={})
+    outputs = [aime_chunk, zebra_chunk]
+    _normalize_reward_extra_info_outputs(outputs)
+    merged = DataProto.concat(outputs)
+
+    assert merged.meta_info["reward_extra_keys"] == ["score", "acc", "pred"]
+    assert merged.non_tensor_batch["score"].tolist() == [1.0, None]
+    assert merged.non_tensor_batch["pred"].tolist() == ["42", None]
 
 
 @pytest.mark.asyncio

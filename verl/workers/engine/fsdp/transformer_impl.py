@@ -24,7 +24,6 @@ from typing import Callable, ContextManager, Optional
 
 import torch
 import torch.distributed
-from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
@@ -39,6 +38,7 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.fsdp_router_trace import FSDPRouterTrace
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -164,6 +164,8 @@ class FSDPEngine(BaseEngine):
             if self.engine_config.use_torch_compile  #  use torch compile by default
             else entropy_from_logits
         )
+        self._router_trace = FSDPRouterTrace()
+        self._router_trace.enabled = bool(getattr(self.engine_config, "router_mismatch_metrics_enabled", False))
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -305,6 +307,8 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _build_lora_module(self, module):
+        from peft import LoraConfig, TaskType, get_peft_model
+
         module.enable_input_require_grads()
 
         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
@@ -558,6 +562,15 @@ class FSDPEngine(BaseEngine):
         if self.rank == 0:
             print_model_size(module)
         log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
+
+        if self._router_trace.enabled:
+            if self.ulysses_sequence_parallel_size > 1:
+                raise ValueError("router.enable_mismatch_metrics does not support FSDP Ulysses SP yet.")
+            hook_count = self._router_trace.install(module)
+            if hook_count == 0:
+                logger.warning("router.enable_mismatch_metrics is enabled, but no HF router modules were found.")
+            else:
+                logger.info("router.enable_mismatch_metrics attached %s FSDP router hooks.", hook_count)
 
         # Wrap model with FSDP for distributed training (sharding, mixed precision, etc.)
         log_gpu_memory_usage("Before FSDP", logger=None)
@@ -1251,7 +1264,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if autocast_dtype == torch.float32
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
-        with autocast_ctx:
+        capture_router_trace = tu.get_non_tensor_data(micro_batch, "capture_router_trace", default=False)
+        with self._router_trace.capture(capture_router_trace), autocast_ctx:
             raw_output = self.module(
                 **model_inputs,
                 use_cache=False,
@@ -1269,6 +1283,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+
+            routed_experts = self._router_trace.consume(micro_batch)
+            if routed_experts is not None:
+                model_output["routed_experts"] = routed_experts
 
             output = {
                 "model_output": model_output,

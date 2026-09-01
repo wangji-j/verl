@@ -217,6 +217,18 @@ def is_correct_strict_box(
     return 1 if (extracted_pred == gt) else -1, extracted_pred
 
 
+def is_correct_boxed_or_answer(solution_str: str, gt: str) -> tuple[bool, str]:
+    """Prefer the final boxed answer, then fall back to the legacy Answer: pattern."""
+    boxed_pred = last_boxed_only_string(solution_str)
+    if boxed_pred is not None:
+        extracted_pred = remove_boxed(boxed_pred)
+        pred = normalize_final_answer(extracted_pred)
+        gt = normalize_final_answer(gt)
+        return pred == gt, pred
+
+    return is_correct_minerva(solution_str, gt)
+
+
 def verify(
     solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: Optional[list[int]] = None
 ) -> bool:
@@ -235,7 +247,7 @@ def verify(
         correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
         return correct == 1, pred
 
-    correct, pred = is_correct_minerva(solution_str, answer)
+    correct, pred = is_correct_boxed_or_answer(solution_str, answer)
     return correct, pred
 
 
@@ -256,8 +268,8 @@ def compute_score(
     Returns:
         Reward score (1.0 for correct, -1.0 for incorrect)
     """
-    # Limit solution length for efficiency
-    solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
+    # Prefer final boxed answers while keeping the legacy Answer: fallback.
+    solution_str = solution_str[-1000:]
 
     # Verify the solution
     correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)

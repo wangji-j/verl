@@ -46,17 +46,33 @@ def default_compute_score(
 
         res = gsm8k.compute_score(solution_str, ground_truth)
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
-        from . import math_reward
+        # Use Math-Verify (symbolic equivalence) instead of string matching to
+        # avoid penalizing correct answers written in a different form
+        # (e.g. 0.5 vs \frac{1}{2}). Requires `pip install math-verify`.
+        from . import math_verify
 
-        res = math_reward.compute_score(solution_str, ground_truth)
-        # [Optional] Math-Verify Integration
-        # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
-        # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
-        # To use it, override the `compute_score` function with the following implementation:
+        res = math_verify.compute_score(solution_str, ground_truth)
+    elif data_source == "allenai/ZebraLogicBench":
+        from . import zebra_logic
 
-        # from . import math_verify
-        # res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
+        res = zebra_logic.compute_score(solution_str, ground_truth)
+    elif data_source in [
+        "Idavidrein/gpqa-diamond",
+        "TIGER-Lab/MMLU-Pro-STEM",
+        "ceval/ceval-exam-STEM",
+    ]:
+        from . import multiple_choice
+
+        res = multiple_choice.compute_score(solution_str, ground_truth)
+    elif data_source in ["8188zq/AutoLogi-en", "8188zq/AutoLogi-cn"]:
+        from . import autologi
+
+        res = autologi.compute_score(solution_str, ground_truth)
+    elif (
+        data_source in ["math_dapo", "math", "math_dapo_reasoning"]
+        or data_source.lower().startswith("aime")
+        or "deepscaler" in data_source.lower()
+    ):
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
@@ -71,6 +87,12 @@ def default_compute_score(
         from . import prime_math
 
         res = prime_math.compute_score(solution_str, ground_truth)
+    elif data_source == "livecodebench":
+        from .rllm_code import compute_score_lcb
+
+        # Coding GRPO uses a binary pass-all-tests reward. Partial test credit
+        # changes the objective and is intentionally disabled here.
+        res = compute_score_lcb(solution_str, ground_truth, continuous=False)
     elif data_source in ["codecontests", "apps", "codeforces", "taco"]:
         # Use the passed sandbox_fusion_url if available
         if sandbox_fusion_url:

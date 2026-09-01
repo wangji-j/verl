@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import inspect
+import importlib
 import logging
 from dataclasses import dataclass, field
 from unittest.mock import patch
@@ -44,6 +45,22 @@ class FP8State:
 
 
 fp8_state: FP8State = FP8State()
+
+
+def _disable_broken_deep_ep_for_vllm_imports():
+    """Make vLLM treat DeepEP as unavailable if its extension cannot load."""
+    try:
+        importlib.import_module("deep_ep")
+    except ModuleNotFoundError:
+        return
+    except ImportError as exc:
+        logger.warning(
+            "DeepEP is present but failed to import; disabling vLLM DeepEP optional paths. Error: %s",
+            exc,
+        )
+        import vllm.utils.import_utils as vllm_import_utils
+
+        vllm_import_utils.has_deep_ep = lambda: False
 
 
 def is_fp8_model(vllm_config):
@@ -704,6 +721,9 @@ def apply_vllm_fp8_patches():
     if fp8_state.vllm_patches:
         logger.debug("vLLM FP8 patches already applied")
         return
+
+    _disable_broken_deep_ep_for_vllm_imports()
+    importlib.import_module("vllm.model_executor.layers.quantization.fp8")
 
     func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
     func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"

@@ -354,7 +354,7 @@ class vLLMHttpServer:
                 lora_args["fully_sharded_loras"] = True
             args.update(lora_args)
 
-        if self.config.enable_rollout_routing_replay:
+        if self.config.enable_rollout_routing_replay or getattr(self.config, "enable_return_routed_experts", False):
             args.update({"enable_return_routed_experts": True})
 
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
@@ -567,7 +567,7 @@ class vLLMHttpServer:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
 
         routed_experts = None
-        if self.config.enable_rollout_routing_replay:
+        if self.config.enable_rollout_routing_replay or getattr(self.config, "enable_return_routed_experts", False):
             routed_experts = final_res.outputs[0].routed_experts
 
         # Determine stop reason from finish_reason

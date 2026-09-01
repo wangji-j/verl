@@ -17,7 +17,6 @@ import logging
 import os
 
 import aiohttp
-import numpy as np
 import ray
 from omegaconf import DictConfig, open_dict
 from ray.actor import ActorHandle
@@ -29,6 +28,7 @@ from verl.trainer.ppo.reward import load_reward_manager, resolve_reward_manager_
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.ray_utils import get_event_loop
+from verl.utils.reward_extra_info import collate_reward_extra_infos
 
 from .reward_model import RewardModelManager
 
@@ -116,6 +116,8 @@ class RewardLoopWorker:
         self.reward_router_address = reward_router_address
         self._init_reward_fn()
         self.loop = get_event_loop()
+        max_concurrency = int(os.getenv("VERL_REWARD_WORKER_MAX_CONCURRENCY", "0"))
+        self._compute_score_semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency > 0 else None
 
     def _init_reward_fn(self):
         input_tokenizer_path = self.config.actor_rollout_ref.model.tokenizer_path
@@ -143,6 +145,12 @@ class RewardLoopWorker:
         return outputs
 
     async def compute_score(self, data: DataProto) -> dict:
+        if self._compute_score_semaphore is not None:
+            async with self._compute_score_semaphore:
+                return await self._compute_score(data)
+        return await self._compute_score(data)
+
+    async def _compute_score(self, data: DataProto) -> dict:
         if self.config.reward.custom_reward_function.path is not None:
             # directly use user-customized reward function
             return await self.reward_manager.run_single(data)
@@ -339,10 +347,7 @@ class RewardLoopManager:
         batch = TensorDict({"rm_scores": rm_scores}, batch_size=len(data))
 
         reward_extra_infos = [output.get("reward_extra_info", {}) for output in outputs_flat]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
-        non_tensor_batch = {}
-        for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+        non_tensor_batch, reward_extra_keys = collate_reward_extra_infos(reward_extra_infos)
 
         if self.reward_model_manager is not None:
             self.reward_model_manager.sleep()

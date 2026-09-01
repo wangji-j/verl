@@ -19,7 +19,9 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
+import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -59,12 +61,18 @@ from verl.trainer.ppo.utils import (
 )
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.checkpoint.local_retention import cleanup_local_global_step_checkpoints
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
+from verl.utils.reward_extra_info import extend_aligned_reward_extra_infos
 from verl.utils.rollout_skip import RolloutSkip
+from verl.utils.router_mismatch_metrics import (
+    compute_length_conditional_percentiles,
+    compute_router_mismatch_metrics,
+)
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -329,6 +337,31 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        self.router_mismatch_metrics_enabled = bool(
+            OmegaConf.select(self.config, "router.enable_mismatch_metrics", default=False)
+        )
+        self._router_mismatch_alignment_sums: dict[int, float] = defaultdict(float)
+        self._router_mismatch_alignment_counts: dict[int, int] = defaultdict(int)
+        self._router_mismatch_alignment_observations = 0
+        self._router_mismatch_frozen_alignment: int | None = None
+        if self.router_mismatch_metrics_enabled:
+            actor_strategy = OmegaConf.select(self.config, "actor_rollout_ref.actor.strategy")
+            rollout_name = OmegaConf.select(self.config, "actor_rollout_ref.rollout.name")
+            if actor_strategy not in {"fsdp", "fsdp2", "megatron"}:
+                raise ValueError(
+                    "router.enable_mismatch_metrics requires FSDP or Megatron actor strategy; "
+                    f"got actor_rollout_ref.actor.strategy={actor_strategy!r}"
+                )
+            if rollout_name != "vllm":
+                raise ValueError(
+                    "router.enable_mismatch_metrics requires vLLM rollout; "
+                    f"got actor_rollout_ref.rollout.name={rollout_name!r}"
+                )
+            with open_dict(self.config):
+                if "router" not in self.config.actor_rollout_ref:
+                    self.config.actor_rollout_ref.router = {}
+                self.config.actor_rollout_ref.router.enable_mismatch_metrics = True
+                self.config.actor_rollout_ref.rollout.enable_return_routed_experts = True
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -370,6 +403,31 @@ class RayPPOTrainer:
 
         self.checkpoint_manager = None
         self._init_dump_executor()
+
+    def _perf_debug_dir(self) -> str:
+        return os.getenv("VERL_PERF_DEBUG_DIR", "").strip()
+
+    def _write_perf_debug(self, name: str, row: dict[str, Any]) -> None:
+        debug_dir = self._perf_debug_dir()
+        if not debug_dir:
+            return
+        os.makedirs(debug_dir, exist_ok=True)
+        global_step = int(getattr(self, "global_steps", -1))
+        payload = {"global_step": global_step, "debug_name": name, **row}
+        path = os.path.join(debug_dir, f"{name}_step{global_step:04d}.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+    @staticmethod
+    def _cuda_memory_snapshot(device: torch.device | None = None) -> dict[str, float]:
+        if not torch.cuda.is_available():
+            return {}
+        if device is None or device.type != "cuda":
+            device = torch.device("cuda")
+        return {
+            "cuda_memory_allocated_gb": torch.cuda.memory_allocated(device) / (1024**3),
+            "cuda_memory_reserved_gb": torch.cuda.memory_reserved(device) / (1024**3),
+        }
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -569,8 +627,13 @@ class RayPPOTrainer:
         # Take first N samples after shuffling
         samples = samples[:generations_to_log]
 
-        # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        # Log to each configured logger. Logging backends (e.g. wandb) can hit
+        # transient server errors (502, auth re-verification); never let a
+        # sample-logging failure kill a multi-day training run.
+        try:
+            self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        except Exception as e:
+            print(f"WARNING: failed to log validation generations (non-fatal): {e}")
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -597,6 +660,11 @@ class RayPPOTrainer:
         return batch_reward
 
     def _validate(self, merged: bool = False):
+        validate_t0 = time.perf_counter()
+        validate_generate_s = 0.0
+        validate_decode_s = 0.0
+        validate_reward_s = 0.0
+        validate_response_lengths = []
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -640,7 +708,9 @@ class RayPPOTrainer:
             # pad to be divisible by dp_size
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            generate_t0 = time.perf_counter()
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            validate_generate_s += time.perf_counter() - generate_t0
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
@@ -658,7 +728,12 @@ class RayPPOTrainer:
             print("validation generation end")
 
             # Store generated outputs
+            decode_t0 = time.perf_counter()
             output_ids = test_output_gen_batch.batch["responses"]
+            pad_token_id = self.tokenizer.pad_token_id
+            if pad_token_id is not None:
+                lengths = (output_ids != pad_token_id).sum(dim=-1).cpu().tolist()
+                validate_response_lengths.extend(int(length) for length in lengths)
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
@@ -671,21 +746,24 @@ class RayPPOTrainer:
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            validate_decode_s += time.perf_counter() - decode_t0
 
             # evaluate using reward_function
+            reward_t0 = time.perf_counter()
             reward_tensor, reward_extra_info = extract_reward(test_batch)
+            validate_reward_s += time.perf_counter() - reward_t0
 
             scores = reward_tensor.sum(-1).cpu().tolist()
+            prior_sample_count = len(sample_scores)
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
-            for key, values in reward_extra_info.items():
-                if key not in reward_extra_infos_dict:
-                    reward_extra_infos_dict[key] = []
-                if isinstance(values, np.ndarray):
-                    reward_extra_infos_dict[key].extend(values.tolist())
-                else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+            extend_aligned_reward_extra_infos(
+                reward_extra_infos_dict,
+                reward_extra_info,
+                batch_size=len(scores),
+                prior_size=prior_sample_count,
+            )
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -693,7 +771,28 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
+        log_t0 = time.perf_counter()
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        validate_log_s = time.perf_counter() - log_t0
+        validate_total_s = time.perf_counter() - validate_t0
+        length_arr = np.asarray(validate_response_lengths, dtype=np.float64)
+        max_response_length = int(self.config.data.max_response_length)
+        num_tokens = int(length_arr.sum()) if length_arr.size > 0 else 0
+        perf_debug_row = {
+            "total_s": validate_total_s,
+            "generate_s": validate_generate_s,
+            "decode_s": validate_decode_s,
+            "reward_s": validate_reward_s,
+            "log_generations_s": validate_log_s,
+            "num_responses": int(length_arr.size),
+            "num_response_tokens": num_tokens,
+            "time_per_token_s": validate_total_s / max(num_tokens, 1),
+            "response_length_mean": float(length_arr.mean()) if length_arr.size > 0 else 0.0,
+            "response_length_max": float(length_arr.max()) if length_arr.size > 0 else 0.0,
+            "response_clip_ratio": float((length_arr >= max_response_length).mean()) if length_arr.size > 0 else 0.0,
+            **{f"after_validate_{k}": v for k, v in self._cuda_memory_snapshot().items()},
+        }
+        self._write_perf_debug("validation", perf_debug_row)
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -766,8 +865,8 @@ class RayPPOTrainer:
         reward_extra_infos_dict = {}
         all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
         for key in all_keys:
-            list_a = result_a["reward_extra_infos_dict"].get(key, [])
-            list_b = result_b["reward_extra_infos_dict"].get(key, [])
+            list_a = result_a["reward_extra_infos_dict"].get(key, [None] * len(result_a["sample_uids"]))
+            list_b = result_b["reward_extra_infos_dict"].get(key, [None] * len(result_b["sample_uids"]))
             reward_extra_infos_dict[key] = list_a + list_b
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
@@ -1001,8 +1100,22 @@ class RayPPOTrainer:
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
 
+        checkpoint_async_save = bool(self.config.actor_rollout_ref.actor.checkpoint.get("async_save", False))
+        centralized_local_retention = (
+            not checkpoint_async_save
+            and self.config.trainer.default_hdfs_dir is None
+            and (
+                (max_actor_ckpt_to_keep is not None and max_actor_ckpt_to_keep > 0)
+                or (self.use_critic and max_critic_ckpt_to_keep is not None and max_critic_ckpt_to_keep > 0)
+            )
+        )
+
+        # On a shared filesystem, every distributed worker deleting the same old
+        # directory is racy. Synchronous local saves are rotated once by this
+        # controller after the complete global-step checkpoint is durable.
+        actor_worker_retention = None if centralized_local_retention else max_actor_ckpt_to_keep
         self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=actor_worker_retention
         )
 
         if self.use_critic:
@@ -1014,8 +1127,9 @@ class RayPPOTrainer:
                     self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", str(Role.Critic)
                 )
             )
+            critic_worker_retention = None if centralized_local_retention else max_critic_ckpt_to_keep
             self.critic_wg.save_checkpoint(
-                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=critic_worker_retention
             )
 
         # save dataloader
@@ -1025,20 +1139,36 @@ class RayPPOTrainer:
         torch.save(dataloader_state_dict, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
-        if (
-            hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
-            and self.config.actor_rollout_ref.actor.checkpoint.async_save
-        ) or (
-            "async_save" in self.config.actor_rollout_ref.actor.checkpoint
-            and self.config.actor_rollout_ref.actor.checkpoint["async_save"]
-        ):
+        if checkpoint_async_save:
             print("skip write latest_checkpointed_iteration.txt when async_save is True")
             return
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
-        with open(local_latest_checkpointed_iteration, "w") as f:
+        tracker_tmp_path = f"{local_latest_checkpointed_iteration}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        with open(tracker_tmp_path, "w") as f:
             f.write(str(self.global_steps))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tracker_tmp_path, local_latest_checkpointed_iteration)
+
+        if centralized_local_retention:
+            retention_limits = [
+                limit
+                for limit in (max_actor_ckpt_to_keep, max_critic_ckpt_to_keep if self.use_critic else None)
+                if limit is not None and limit > 0
+            ]
+            max_global_ckpt_to_keep = max(retention_limits)
+            deleted_paths = cleanup_local_global_step_checkpoints(
+                self.config.trainer.default_local_dir,
+                self.global_steps,
+                max_global_ckpt_to_keep,
+            )
+            if deleted_paths:
+                print(
+                    f"Checkpoint retention kept the latest {max_global_ckpt_to_keep} checkpoint(s) "
+                    f"and deleted: {deleted_paths}"
+                )
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1280,6 +1410,8 @@ class RayPPOTrainer:
         log_probs = no_padding_2_padding(log_probs, batch_td)
         if sum_pi_squared is not None:
             sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
+        if routed_experts is not None:
+            routed_experts = no_padding_2_padding(routed_experts, batch_td)
         # step 5: rebuild a tensordict and convert to dataproto
         result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
         if routed_experts is not None:
@@ -1289,6 +1421,552 @@ class RayPPOTrainer:
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
+
+    def _ensure_router_mismatch_state(self) -> None:
+        """Idempotently initialize the router-mismatch instance state.
+
+        ``RayPPOTrainer.__init__`` sets these attributes, but some trainers
+        (e.g. the fully-async ``FullyAsyncTrainer``) re-implement ``__init__``
+        without calling ``super().__init__()`` and therefore never create them.
+        The RDC rejection-sampling path calls this before touching the state so
+        it works regardless of the init chain. No-op once initialized (and for
+        trainers that already went through ``RayPPOTrainer.__init__``).
+        """
+        if hasattr(self, "router_mismatch_metrics_enabled"):
+            return
+        self.router_mismatch_metrics_enabled = bool(
+            OmegaConf.select(self.config, "router.enable_mismatch_metrics", default=False)
+        )
+        self._router_mismatch_alignment_sums = defaultdict(float)
+        self._router_mismatch_alignment_counts = defaultdict(int)
+        self._router_mismatch_alignment_observations = 0
+        self._router_mismatch_frozen_alignment = None
+
+    def _router_mismatch_rs_enabled(self) -> bool:
+        return bool(OmegaConf.select(self.config, "router.enable_mismatch_rs", default=False))
+
+    def _router_mismatch_rs_threshold(self) -> float:
+        return float(OmegaConf.select(self.config, "router.mismatch_rs_threshold", default=0.8))
+
+    def _router_mismatch_rs_mode(self) -> str:
+        return str(OmegaConf.select(self.config, "router.mismatch_rs_mode", default="threshold"))
+
+    def _router_mismatch_rs_fraction(self) -> float:
+        return float(OmegaConf.select(self.config, "router.mismatch_rs_fraction", default=0.1))
+
+    def _router_mismatch_rs_length_bucket_edges(self) -> list[int]:
+        value = OmegaConf.select(self.config, "router.mismatch_rs_length_bucket_edges", default=[2048, 4096, 8192, 12288])
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = value.strip().strip("[]")
+            raw_edges = [item.strip() for item in value.split(",") if item.strip()]
+        else:
+            raw_edges = list(value)
+        edges = sorted({int(edge) for edge in raw_edges if int(edge) > 0})
+        return edges
+
+    def _router_mismatch_rs_max_reject_per_prompt(self) -> int | None:
+        value = OmegaConf.select(self.config, "router.mismatch_rs_max_reject_per_prompt", default=None)
+        if value is None:
+            return None
+        value = int(value)
+        return value if value >= 0 else None
+
+    def _router_mismatch_rs_mad_epsilon(self) -> float:
+        return float(OmegaConf.select(self.config, "router.mismatch_rs_mad_epsilon", default=1e-6))
+
+    def _router_mismatch_rs_local_window(self) -> int:
+        return int(OmegaConf.select(self.config, "router.mismatch_rs_local_window", default=256))
+
+    def _router_mismatch_rs_censored_length(self) -> int | None:
+        value = OmegaConf.select(self.config, "router.mismatch_rs_censored_length", default=None)
+        return None if value is None else int(value)
+
+    def _router_mismatch_rs_min_censored_count(self) -> int:
+        return int(OmegaConf.select(self.config, "router.mismatch_rs_min_censored_count", default=32))
+
+    def _router_mismatch_metric_mode(self) -> str:
+        return str(OmegaConf.select(self.config, "router.mismatch_metric_mode", default="exact_set"))
+
+    def _router_expert_usage_smoothing_tau(self) -> float:
+        return float(OmegaConf.select(self.config, "router.expert_usage_smoothing_tau", default=4096.0))
+
+    def _router_expert_usage_num_experts(self) -> int | None:
+        value = OmegaConf.select(self.config, "router.expert_usage_num_experts", default=None)
+        return None if value is None else int(value)
+
+    def _router_mismatch_alignment_warmup_steps(self) -> int:
+        return int(OmegaConf.select(self.config, "router.mismatch_alignment_warmup_steps", default=3))
+
+    def _maybe_compute_router_mismatch_metrics(self, batch: DataProto, old_log_prob: DataProto) -> dict[str, float]:
+        result = self._compute_router_mismatch_result(batch, old_log_prob)
+        return result.metrics if result is not None else {}
+
+    def _compute_router_mismatch_result(self, batch: DataProto, old_log_prob: DataProto):
+        if not self.router_mismatch_metrics_enabled:
+            return None
+        if "routed_experts" not in batch.batch:
+            raise RuntimeError("router.enable_mismatch_metrics requires rollout routed_experts from vLLM.")
+        if "routed_experts" not in old_log_prob.batch:
+            raise RuntimeError("router.enable_mismatch_metrics requires actor routed_experts from old_log_prob.")
+
+        rollout_routes = batch.batch["routed_experts"]
+        train_routes = old_log_prob.batch["routed_experts"]
+        response_mask = batch.batch["response_mask"]
+        debug_device = train_routes.device if getattr(train_routes, "is_cuda", False) else rollout_routes.device
+        debug_before = self._cuda_memory_snapshot(debug_device)
+        debug_t0 = time.perf_counter()
+        alignments = (
+            (self._router_mismatch_frozen_alignment,)
+            if self._router_mismatch_frozen_alignment is not None
+            else (0, -1, 1)
+        )
+        dump_mode = os.getenv("VERL_ROUTER_ANALYSIS_DUMP_MODE", "summary").strip().lower()
+        should_capture_counts = False
+        if dump_mode == "expert_counts" and hasattr(self, "_should_dump_router_analysis"):
+            should_capture_counts = bool(self._should_dump_router_analysis(int(getattr(self, "global_steps", -1))))
+        result = compute_router_mismatch_metrics(
+            rollout_routes,
+            train_routes,
+            response_mask,
+            metric_prefix="router/rollout_vs_train",
+            alignments=alignments,
+            metric_mode=self._router_mismatch_metric_mode(),
+            expert_usage_smoothing_tau=self._router_expert_usage_smoothing_tau(),
+            expert_usage_num_experts=self._router_expert_usage_num_experts(),
+            capture_expert_usage_counts=should_capture_counts,
+        )
+        debug_after = self._cuda_memory_snapshot(debug_device)
+        self._write_perf_debug(
+            "router_mismatch",
+            {
+                "duration_s": time.perf_counter() - debug_t0,
+                "metric_mode": self._router_mismatch_metric_mode(),
+                "alignments": list(alignments),
+                "selected_alignment": result.alignment,
+                "alignment_frozen_before": self._router_mismatch_frozen_alignment is not None,
+                "rollout_routes_shape": list(rollout_routes.shape),
+                "train_routes_shape": list(train_routes.shape),
+                "response_mask_shape": list(response_mask.shape),
+                "response_mask_tokens": int(response_mask.sum().item()),
+                "rollout_routes_dtype": str(rollout_routes.dtype),
+                "train_routes_dtype": str(train_routes.dtype),
+                "rollout_routes_device": str(rollout_routes.device),
+                "train_routes_device": str(train_routes.device),
+                **{f"before_{k}": v for k, v in debug_before.items()},
+                **{f"after_{k}": v for k, v in debug_after.items()},
+            },
+        )
+        self._update_router_mismatch_alignment_state(result)
+        return result
+
+    def _update_router_mismatch_alignment_state(self, router_result) -> None:
+        metrics = router_result.metrics
+        metrics["router/rollout_vs_train/selected_alignment"] = float(router_result.alignment)
+        metrics["router/rollout_vs_train/alignment_frozen"] = float(
+            self._router_mismatch_frozen_alignment is not None
+        )
+        if self._router_mismatch_frozen_alignment is not None:
+            return
+
+        scores = router_result.alignment_scores or {}
+        if not scores:
+            return
+
+        for alignment, score in scores.items():
+            self._router_mismatch_alignment_sums[int(alignment)] += float(score)
+            self._router_mismatch_alignment_counts[int(alignment)] += 1
+
+        self._router_mismatch_alignment_observations += 1
+
+        warmup_steps = max(self._router_mismatch_alignment_warmup_steps(), 1)
+        if self._router_mismatch_alignment_observations >= warmup_steps:
+            averages = {
+                alignment: self._router_mismatch_alignment_sums[alignment] / max(count, 1)
+                for alignment, count in self._router_mismatch_alignment_counts.items()
+            }
+            self._router_mismatch_frozen_alignment = max(averages, key=lambda alignment: averages[alignment])
+            metrics["router/rollout_vs_train/frozen_alignment"] = float(self._router_mismatch_frozen_alignment)
+            metrics["router/rollout_vs_train/alignment_frozen"] = 1.0
+
+    def _apply_router_mismatch_rs(self, batch: DataProto, router_result) -> dict[str, float]:
+        if (
+            not self._router_mismatch_rs_enabled()
+            or router_result is None
+            or router_result.seq_mismatch is None
+            or router_result.seq_valid_token_count is None
+        ):
+            return {}
+
+        seq_mismatch = router_result.seq_mismatch.to(device=batch.batch["response_mask"].device)
+        seq_valid_token_count = router_result.seq_valid_token_count.to(device=batch.batch["response_mask"].device)
+        valid_seq = seq_valid_token_count > 0
+        mode = self._router_mismatch_rs_mode()
+        threshold = self._router_mismatch_rs_threshold()
+        fraction = self._router_mismatch_rs_fraction()
+        bucket_metrics: dict[str, float] = {}
+
+        if mode == "threshold":
+            reject = valid_seq & (seq_mismatch > threshold)
+            effective_threshold = threshold
+        elif mode == "top_fraction":
+            reject = torch.zeros_like(valid_seq, dtype=torch.bool)
+            valid_indices = torch.nonzero(valid_seq, as_tuple=False).flatten()
+            valid_count_for_topk = int(valid_indices.numel())
+            if fraction > 0 and valid_count_for_topk > 0:
+                k = min(max(math.ceil(valid_count_for_topk * fraction), 1), valid_count_for_topk)
+                valid_scores = seq_mismatch[valid_indices]
+                topk_values, topk_pos = torch.topk(valid_scores, k=k, largest=True, sorted=False)
+                reject[valid_indices[topk_pos]] = True
+                effective_threshold = float(topk_values.min().item())
+            else:
+                effective_threshold = 0.0
+        elif mode == "length_bucket_top_fraction":
+            reject = torch.zeros_like(valid_seq, dtype=torch.bool)
+            effective_threshold = 0.0
+            bucket_edges = self._router_mismatch_rs_length_bucket_edges()
+            bucket_lowers = [0] + bucket_edges
+            bucket_uppers = bucket_edges + [None]
+            thresholds = []
+            for bucket_idx, (lower, upper) in enumerate(zip(bucket_lowers, bucket_uppers, strict=True)):
+                in_bucket = valid_seq & (seq_valid_token_count >= float(lower))
+                if upper is not None:
+                    in_bucket = in_bucket & (seq_valid_token_count < float(upper))
+                bucket_indices = torch.nonzero(in_bucket, as_tuple=False).flatten()
+                bucket_count = int(bucket_indices.numel())
+                bucket_reject_count = 0
+                bucket_threshold = 0.0
+                if fraction > 0 and bucket_count > 0:
+                    k = min(max(math.ceil(bucket_count * fraction), 1), bucket_count)
+                    bucket_scores = seq_mismatch[bucket_indices]
+                    topk_values, topk_pos = torch.topk(bucket_scores, k=k, largest=True, sorted=False)
+                    reject[bucket_indices[topk_pos]] = True
+                    bucket_reject_count = int(k)
+                    bucket_threshold = float(topk_values.min().item())
+                    thresholds.append(bucket_threshold)
+                if bucket_count > 0:
+                    bucket_scores_all = seq_mismatch[bucket_indices]
+                    bucket_lengths_all = seq_valid_token_count[bucket_indices]
+                    prefix = f"router/rollout_vs_train/rs_bucket_{bucket_idx}"
+                    bucket_metrics[f"{prefix}_lower"] = float(lower)
+                    bucket_metrics[f"{prefix}_upper"] = float(upper) if upper is not None else -1.0
+                    bucket_metrics[f"{prefix}_count"] = float(bucket_count)
+                    bucket_metrics[f"{prefix}_rejected_count"] = float(bucket_reject_count)
+                    bucket_metrics[f"{prefix}_rejected_fraction"] = float(bucket_reject_count / bucket_count)
+                    bucket_metrics[f"{prefix}_threshold"] = float(bucket_threshold)
+                    bucket_metrics[f"{prefix}_score_mean"] = float(bucket_scores_all.float().mean().item())
+                    bucket_metrics[f"{prefix}_length_mean"] = float(bucket_lengths_all.float().mean().item())
+            if thresholds:
+                effective_threshold = min(thresholds)
+        elif mode == "length_bucket_mad_zscore_top_fraction":
+            reject = torch.zeros_like(valid_seq, dtype=torch.bool)
+            z_scores = torch.full_like(seq_mismatch, float("-inf"), dtype=torch.float32)
+            bucket_ids = torch.full_like(seq_valid_token_count, -1, dtype=torch.long)
+            bucket_edges = self._router_mismatch_rs_length_bucket_edges()
+            bucket_lowers = [0] + bucket_edges
+            bucket_uppers = bucket_edges + [None]
+            mad_epsilon = max(self._router_mismatch_rs_mad_epsilon(), torch.finfo(torch.float32).eps)
+
+            for bucket_idx, (lower, upper) in enumerate(zip(bucket_lowers, bucket_uppers, strict=True)):
+                in_bucket = valid_seq & (seq_valid_token_count >= float(lower))
+                if upper is not None:
+                    in_bucket = in_bucket & (seq_valid_token_count < float(upper))
+                bucket_indices = torch.nonzero(in_bucket, as_tuple=False).flatten()
+                bucket_count = int(bucket_indices.numel())
+                if bucket_count == 0:
+                    continue
+
+                bucket_scores = seq_mismatch[bucket_indices].float()
+                median = bucket_scores.median()
+                mad = (bucket_scores - median).abs().median()
+                scale = torch.clamp(mad, min=mad_epsilon)
+                bucket_z = (bucket_scores - median) / scale
+                z_scores[bucket_indices] = bucket_z
+                bucket_ids[bucket_indices] = bucket_idx
+
+                prefix = f"router/rollout_vs_train/rs_bucket_{bucket_idx}"
+                bucket_metrics[f"{prefix}_lower"] = float(lower)
+                bucket_metrics[f"{prefix}_upper"] = float(upper) if upper is not None else -1.0
+                bucket_metrics[f"{prefix}_count"] = float(bucket_count)
+                bucket_metrics[f"{prefix}_score_mean"] = float(bucket_scores.mean().item())
+                bucket_metrics[f"{prefix}_score_median"] = float(median.item())
+                bucket_metrics[f"{prefix}_score_mad"] = float(mad.item())
+                bucket_metrics[f"{prefix}_z_mean"] = float(bucket_z.mean().item())
+                bucket_metrics[f"{prefix}_z_max"] = float(bucket_z.max().item())
+                bucket_metrics[f"{prefix}_length_mean"] = float(
+                    seq_valid_token_count[bucket_indices].float().mean().item()
+                )
+
+            valid_indices = torch.nonzero(valid_seq, as_tuple=False).flatten()
+            target_rejected_count = 0
+            skipped_by_prompt_cap = 0
+            max_per_prompt = self._router_mismatch_rs_max_reject_per_prompt()
+            uids = batch.non_tensor_batch.get("uid") if hasattr(batch, "non_tensor_batch") else None
+            can_apply_prompt_cap = (
+                max_per_prompt is not None and uids is not None and len(uids) == int(reject.numel())
+            )
+            if max_per_prompt is not None and not can_apply_prompt_cap:
+                raise RuntimeError(
+                    "length_bucket_mad_zscore_top_fraction requires one uid per response when "
+                    "router.mismatch_rs_max_reject_per_prompt is configured."
+                )
+            if fraction > 0 and int(valid_indices.numel()) > 0:
+                target_rejected_count = min(
+                    max(math.ceil(int(valid_indices.numel()) * fraction), 1), int(valid_indices.numel())
+                )
+                sorted_pos = torch.argsort(z_scores[valid_indices], descending=True)
+                sorted_indices = valid_indices[sorted_pos].detach().cpu().tolist()
+                rejected_per_prompt: dict[object, int] = {}
+                selected_indices: list[int] = []
+                for sample_idx in sorted_indices:
+                    if len(selected_indices) >= target_rejected_count:
+                        break
+                    if can_apply_prompt_cap:
+                        uid = uids[sample_idx]
+                        uid_key = uid.item() if hasattr(uid, "item") else uid
+                        try:
+                            hash(uid_key)
+                        except TypeError:
+                            uid_key = str(uid_key)
+                        if rejected_per_prompt.get(uid_key, 0) >= max_per_prompt:
+                            skipped_by_prompt_cap += 1
+                            continue
+                        rejected_per_prompt[uid_key] = rejected_per_prompt.get(uid_key, 0) + 1
+                    selected_indices.append(sample_idx)
+                if selected_indices:
+                    selected_tensor = torch.tensor(selected_indices, device=reject.device, dtype=torch.long)
+                    reject[selected_tensor] = True
+                    effective_threshold = float(z_scores[selected_tensor].min().item())
+                else:
+                    effective_threshold = 0.0
+            else:
+                effective_threshold = 0.0
+
+            for bucket_idx in range(len(bucket_lowers)):
+                in_bucket = valid_seq & (bucket_ids == bucket_idx)
+                bucket_count = int(in_bucket.sum().item())
+                bucket_rejected_count = int((reject & in_bucket).sum().item())
+                if bucket_count > 0:
+                    prefix = f"router/rollout_vs_train/rs_bucket_{bucket_idx}"
+                    bucket_metrics[f"{prefix}_rejected_count"] = float(bucket_rejected_count)
+                    bucket_metrics[f"{prefix}_rejected_fraction"] = float(bucket_rejected_count / bucket_count)
+                    if bucket_rejected_count > 0:
+                        rejected_in_bucket = reject & in_bucket
+                        bucket_metrics[f"{prefix}_rejected_score_mean"] = float(
+                            seq_mismatch[rejected_in_bucket].float().mean().item()
+                        )
+                        bucket_metrics[f"{prefix}_rejected_z_mean"] = float(
+                            z_scores[rejected_in_bucket].mean().item()
+                        )
+                        bucket_metrics[f"{prefix}_rejected_length_mean"] = float(
+                            seq_valid_token_count[rejected_in_bucket].float().mean().item()
+                        )
+                    bucket_kept_count = bucket_count - bucket_rejected_count
+                    if bucket_kept_count > 0:
+                        kept_in_bucket = in_bucket & ~reject
+                        bucket_metrics[f"{prefix}_kept_score_mean"] = float(
+                            seq_mismatch[kept_in_bucket].float().mean().item()
+                        )
+                        bucket_metrics[f"{prefix}_kept_z_mean"] = float(z_scores[kept_in_bucket].mean().item())
+                        bucket_metrics[f"{prefix}_kept_length_mean"] = float(
+                            seq_valid_token_count[kept_in_bucket].float().mean().item()
+                        )
+            bucket_metrics["router/rollout_vs_train/rs_target_rejected_count"] = float(target_rejected_count)
+            bucket_metrics["router/rollout_vs_train/rs_prompt_cap_skipped_count"] = float(skipped_by_prompt_cap)
+            bucket_metrics["router/rollout_vs_train/rs_mad_epsilon"] = float(mad_epsilon)
+            if bool(valid_seq.any().item()):
+                bucket_metrics["router/rollout_vs_train/rs_z_mean"] = float(z_scores[valid_seq].mean().item())
+            if bool(reject.any().item()):
+                bucket_metrics["router/rollout_vs_train/rs_rejected_z_mean"] = float(z_scores[reject].mean().item())
+            kept_for_z = valid_seq & ~reject
+            if bool(kept_for_z.any().item()):
+                bucket_metrics["router/rollout_vs_train/rs_kept_z_mean"] = float(
+                    z_scores[kept_for_z].mean().item()
+                )
+        elif mode == "length_conditional_percentile_top_fraction":
+            local_window = self._router_mismatch_rs_local_window()
+            censored_length = self._router_mismatch_rs_censored_length()
+            min_censored_count = self._router_mismatch_rs_min_censored_count()
+            percentile_scores = compute_length_conditional_percentiles(
+                seq_mismatch,
+                seq_valid_token_count,
+                local_window=local_window,
+                censored_length=censored_length,
+                min_censored_count=min_censored_count,
+            )
+            reject = torch.zeros_like(valid_seq, dtype=torch.bool)
+            valid_indices = torch.nonzero(valid_seq, as_tuple=False).flatten()
+            target_rejected_count = 0
+            skipped_by_prompt_cap = 0
+            max_per_prompt = self._router_mismatch_rs_max_reject_per_prompt()
+            uids = batch.non_tensor_batch.get("uid") if hasattr(batch, "non_tensor_batch") else None
+            can_apply_prompt_cap = (
+                max_per_prompt is not None and uids is not None and len(uids) == int(reject.numel())
+            )
+            if max_per_prompt is not None and not can_apply_prompt_cap:
+                raise RuntimeError(
+                    "length_conditional_percentile_top_fraction requires one uid per response when "
+                    "router.mismatch_rs_max_reject_per_prompt is configured."
+                )
+            if fraction > 0 and int(valid_indices.numel()) > 0:
+                target_rejected_count = min(
+                    max(math.ceil(int(valid_indices.numel()) * fraction), 1), int(valid_indices.numel())
+                )
+                sorted_pos = torch.argsort(
+                    percentile_scores[valid_indices], descending=True, stable=True
+                )
+                sorted_indices = valid_indices[sorted_pos].detach().cpu().tolist()
+                rejected_per_prompt: dict[object, int] = {}
+                selected_indices: list[int] = []
+                for sample_idx in sorted_indices:
+                    if len(selected_indices) >= target_rejected_count:
+                        break
+                    if can_apply_prompt_cap:
+                        uid = uids[sample_idx]
+                        uid_key = uid.item() if hasattr(uid, "item") else uid
+                        try:
+                            hash(uid_key)
+                        except TypeError:
+                            uid_key = str(uid_key)
+                        if rejected_per_prompt.get(uid_key, 0) >= max_per_prompt:
+                            skipped_by_prompt_cap += 1
+                            continue
+                        rejected_per_prompt[uid_key] = rejected_per_prompt.get(uid_key, 0) + 1
+                    selected_indices.append(sample_idx)
+                if selected_indices:
+                    selected_tensor = torch.tensor(selected_indices, device=reject.device, dtype=torch.long)
+                    reject[selected_tensor] = True
+                    effective_threshold = float(percentile_scores[selected_tensor].min().item())
+                else:
+                    effective_threshold = 0.0
+            else:
+                effective_threshold = 0.0
+
+            valid_percentiles = percentile_scores[valid_seq]
+            censored_count = 0
+            if censored_length is not None:
+                censored_count = int((valid_seq & (seq_valid_token_count >= censored_length)).sum().item())
+            bucket_metrics.update(
+                {
+                    "router/rollout_vs_train/rs_conditional_percentile_top_fraction": fraction,
+                    "router/rollout_vs_train/rs_conditional_percentile_local_window": float(local_window),
+                    "router/rollout_vs_train/rs_conditional_percentile_mean": float(
+                        valid_percentiles.mean().item()
+                    ),
+                    "router/rollout_vs_train/rs_conditional_percentile_censored_length": float(
+                        censored_length if censored_length is not None else -1
+                    ),
+                    "router/rollout_vs_train/rs_conditional_percentile_censored_count": float(
+                        censored_count
+                    ),
+                    "router/rollout_vs_train/rs_target_rejected_count": float(target_rejected_count),
+                    "router/rollout_vs_train/rs_prompt_cap_skipped_count": float(skipped_by_prompt_cap),
+                }
+            )
+            if bool(reject.any().item()):
+                bucket_metrics["router/rollout_vs_train/rs_rejected_conditional_percentile_mean"] = float(
+                    percentile_scores[reject].mean().item()
+                )
+            kept_for_percentile = valid_seq & ~reject
+            if bool(kept_for_percentile.any().item()):
+                bucket_metrics["router/rollout_vs_train/rs_kept_conditional_percentile_mean"] = float(
+                    percentile_scores[kept_for_percentile].mean().item()
+                )
+        else:
+            raise ValueError(
+                "router.mismatch_rs_mode must be 'threshold', 'top_fraction', 'length_bucket_top_fraction', "
+                "'length_bucket_mad_zscore_top_fraction', or "
+                "'length_conditional_percentile_top_fraction', "
+                f"got {mode!r}"
+            )
+
+        response_mask = batch.batch["response_mask"]
+        reject = reject.to(device=response_mask.device)
+        batch.batch["router_mismatch_reject_mask"] = reject
+        if bool(reject.any().item()):
+            response_mask[reject] = 0
+
+        valid_count = int(valid_seq.sum().item())
+        rejected_count = int(reject.sum().item())
+        kept_count = max(valid_count - rejected_count, 0)
+        rejected_fraction = float(rejected_count / valid_count) if valid_count > 0 else 0.0
+        metrics = {
+            "router/rollout_vs_train/rs_threshold": effective_threshold,
+            "router/rollout_vs_train/rs_config_threshold": threshold,
+            "router/rollout_vs_train/rs_top_fraction": fraction if mode == "top_fraction" else 0.0,
+            "router/rollout_vs_train/rs_length_bucket_top_fraction": fraction
+            if mode == "length_bucket_top_fraction"
+            else 0.0,
+            "router/rollout_vs_train/rs_mad_zscore_top_fraction": fraction
+            if mode == "length_bucket_mad_zscore_top_fraction"
+            else 0.0,
+            "router/rollout_vs_train/rs_conditional_percentile_top_fraction": fraction
+            if mode == "length_conditional_percentile_top_fraction"
+            else 0.0,
+            "router/rollout_vs_train/rs_rejected_fraction": rejected_fraction,
+            "router/rollout_vs_train/rs_rejected_count": float(rejected_count),
+            "router/rollout_vs_train/rs_kept_count": float(kept_count),
+        }
+        if valid_count > 0:
+            valid_lengths = seq_valid_token_count[valid_seq].float()
+            metrics["router/rollout_vs_train/rs_length_before_mean"] = float(valid_lengths.mean().item())
+            if rejected_count > 0:
+                metrics["router/rollout_vs_train/rs_rejected_length_mean"] = float(
+                    seq_valid_token_count[reject].float().mean().item()
+                )
+            if kept_count > 0:
+                metrics["router/rollout_vs_train/rs_kept_length_mean"] = float(
+                    seq_valid_token_count[valid_seq & ~reject].float().mean().item()
+                )
+            token_level_scores = batch.batch.get("token_level_scores")
+            if token_level_scores is not None and token_level_scores.shape[0] == reject.numel():
+                sequence_scores = token_level_scores.float().sum(dim=-1)
+                metrics["router/rollout_vs_train/rs_score_before_mean"] = float(
+                    sequence_scores[valid_seq].mean().item()
+                )
+                if rejected_count > 0:
+                    rejected_scores = sequence_scores[reject]
+                    metrics["router/rollout_vs_train/rs_rejected_score_mean"] = float(
+                        rejected_scores.mean().item()
+                    )
+                    metrics["router/rollout_vs_train/rs_rejected_positive_fraction"] = float(
+                        (rejected_scores > 0).float().mean().item()
+                    )
+                if kept_count > 0:
+                    kept_scores = sequence_scores[valid_seq & ~reject]
+                    metrics["router/rollout_vs_train/rs_kept_score_mean"] = float(kept_scores.mean().item())
+                    metrics["router/rollout_vs_train/rs_kept_positive_fraction"] = float(
+                        (kept_scores > 0).float().mean().item()
+                    )
+        metrics.update(bucket_metrics)
+
+        uids = batch.non_tensor_batch.get("uid") if hasattr(batch, "non_tensor_batch") else None
+        if uids is not None and len(uids) == int(reject.numel()):
+            valid_list = valid_seq.detach().cpu().tolist()
+            reject_list = reject.detach().cpu().tolist()
+            prompt_total: dict[object, int] = {}
+            prompt_rejected: dict[object, int] = {}
+            for uid, is_valid, is_rejected in zip(uids, valid_list, reject_list, strict=False):
+                if not is_valid:
+                    continue
+                uid_key = uid.item() if hasattr(uid, "item") else uid
+                try:
+                    hash(uid_key)
+                except TypeError:
+                    uid_key = str(uid_key)
+                prompt_total[uid_key] = prompt_total.get(uid_key, 0) + 1
+                prompt_rejected[uid_key] = prompt_rejected.get(uid_key, 0) + int(bool(is_rejected))
+            if prompt_total:
+                all_rejected = sum(
+                    1 for uid, total in prompt_total.items() if total > 0 and prompt_rejected.get(uid, 0) == total
+                )
+                metrics["router/rollout_vs_train/rs_prompt_all_rejected_fraction"] = float(
+                    all_rejected / len(prompt_total)
+                )
+                metrics["router/rollout_vs_train/rs_prompt_all_rejected_count"] = float(all_rejected)
+
+        return metrics
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1540,7 +2218,8 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            with marked_timer("old_log_prob_forward", timing_raw, color="blue"):
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1556,7 +2235,23 @@ class RayPPOTrainer:
                             }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
-                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+                            if self.router_mismatch_metrics_enabled:
+                                missing_routed_experts = []
+                                if "routed_experts" not in batch.batch:
+                                    missing_routed_experts.append("rollout/vLLM batch.routed_experts")
+                                if "routed_experts" not in old_log_prob.batch:
+                                    missing_routed_experts.append("actor old_log_prob.routed_experts")
+                                if missing_routed_experts:
+                                    raise RuntimeError(
+                                        "router.enable_mismatch_metrics=True but routed_experts is missing from: "
+                                        + ", ".join(missing_routed_experts)
+                                    )
+                                else:
+                                    with marked_timer("router_mismatch_metrics", timing_raw, color="blue"):
+                                        metrics.update(self._maybe_compute_router_mismatch_metrics(batch, old_log_prob))
+                                    old_log_prob.batch.pop("routed_experts")
+                                    batch.batch.pop("routed_experts")
+                            elif "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
                                     "Detected conflicting router replay configuration: "
                                     "router_replay.mode='R2' and enable_rollout_routing_replay=True "

@@ -60,6 +60,7 @@ class SamplingConfig(BaseConfig):
     top_p: float = 1.0
     do_sample: bool = True
     n: int = 1
+    max_response_length: Optional[int] = None
 
 
 @dataclass
@@ -272,6 +273,8 @@ class RolloutConfig(BaseConfig):
     quantization_config_file: Optional[str] = None
 
     enable_rollout_routing_replay: bool = False
+
+    enable_return_routed_experts: bool = False
 
     enable_sleep_mode: bool = True
 

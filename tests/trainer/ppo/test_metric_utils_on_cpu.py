@@ -542,6 +542,24 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
 
+    def test_process_validation_metrics_with_task_specific_missing_fields(self):
+        """Missing optional fields should not break metrics for mixed validation tasks."""
+        data_sources = ["aime", "aime", "zebra", "zebra"]
+        sample_inputs = ["aime_prompt", "aime_prompt", "zebra_prompt", "zebra_prompt"]
+        infos_dict = {
+            "score": [1.0, 0.0, None, None],
+            "acc": [1.0, 0.0, 1.0, 0.0],
+            "pred": ["42", "41", None, None],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertAlmostEqual(result["aime"]["score"]["mean@2"], 0.5)
+        self.assertIn("maj@2/mean", result["aime"]["score"])
+        self.assertNotIn("score", result["zebra"])
+        self.assertAlmostEqual(result["zebra"]["acc"]["mean@2"], 0.5)
+        self.assertNotIn("maj@2/mean", result["zebra"]["acc"])
+
 
 if __name__ == "__main__":
     unittest.main()

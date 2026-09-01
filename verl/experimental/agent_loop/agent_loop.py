@@ -55,6 +55,7 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import auto_await, get_event_loop
+from verl.utils.reward_extra_info import collate_reward_extra_infos, make_missing_reward_extra_info_array
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
@@ -74,6 +75,23 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+
+def _normalize_reward_extra_info_outputs(outputs: list[DataProto]) -> None:
+    """Give agent-loop worker outputs one aligned reward metadata schema."""
+    reward_extra_keys = list(
+        dict.fromkeys(key for item in outputs for key in item.meta_info.get("reward_extra_keys", []))
+    )
+    if not reward_extra_keys:
+        return
+
+    for item in outputs:
+        if "reward_extra_keys" not in item.meta_info:
+            continue
+        for key in reward_extra_keys:
+            if key not in item.non_tensor_batch:
+                item.non_tensor_batch[key] = make_missing_reward_extra_info_array(len(item))
+        item.meta_info["reward_extra_keys"] = reward_extra_keys
 
 
 class AgentLoopMetrics(BaseModel):
@@ -499,6 +517,7 @@ class AgentLoopWorker:
             top_k=config.top_k,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
+            max_tokens=self._effective_response_length(validate),
         )
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
@@ -596,8 +615,18 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
+            if hasattr(agent_loop, "response_length"):
+                agent_loop.response_length = int(sampling_params["max_tokens"])
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+
+    def _effective_response_length(self, validate: bool) -> int:
+        response_length = self.rollout_config.response_length
+        if validate and self.rollout_config.val_kwargs.max_response_length is not None:
+            response_length = self.rollout_config.val_kwargs.max_response_length
+        if response_length < 1:
+            raise ValueError(f"response length must be positive, got {response_length}")
+        return int(response_length)
 
     def _pad_token_ids(
         self,
@@ -625,6 +654,7 @@ class AgentLoopWorker:
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        response_length = self._effective_response_length(validate)
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -656,21 +686,21 @@ class AgentLoopWorker:
 
         response_output = self._pad_token_ids(
             output.response_ids,
-            max_length=self.rollout_config.response_length,
+            max_length=response_length,
             padding_side="right",
             return_attention_mask=True,
         )
 
         response_mask_output = self._pad_token_ids(
             output.response_mask,
-            max_length=self.rollout_config.response_length,
+            max_length=response_length,
             padding_side="right",
             return_attention_mask=False,
         )
 
         response_logprobs = None
         if output.response_logprobs is not None:
-            pad_size = self.rollout_config.response_length - len(output.response_logprobs)
+            pad_size = response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
@@ -942,7 +972,13 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        if inputs[0].routed_experts is not None:
+        # Require ALL samples to carry routed_experts before concatenating: a
+        # single None (e.g. a generation aborted at a weight-sync boundary when
+        # partial_rollout is off) would otherwise make torch.cat raise
+        # "expected Tensor ... but got NoneType". Dropping routes for the whole
+        # group degrades gracefully (RDC/replay simply skip it) instead of
+        # crashing the rollouter.
+        if all(inp.routed_experts is not None for inp in inputs):
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
@@ -977,9 +1013,8 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
-        for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+        reward_extra_batch, reward_extra_keys = collate_reward_extra_infos(reward_extra_infos)
+        non_tensor_batch.update(reward_extra_batch)
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
@@ -1115,6 +1150,12 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+
+        # Different reward functions may expose different extra fields (for
+        # example, AIME has ``pred`` while ZebraLogic only has ``acc``). Make
+        # every worker chunk use the global union before DataProto.concat.
+        _normalize_reward_extra_info_outputs(outputs)
+
         output = DataProto.concat(outputs)
 
         # calculate performance metrics

@@ -58,14 +58,17 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def _with_routing_replay_flag(enabled: bool):
-    """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
+def _with_routing_replay_flag(enabled: bool, capture_router_trace: bool | None = None):
+    """Decorator to set routing replay and optional router trace flags on the data TensorDict."""
 
     def decorator(func):
         @functools.wraps(func)
         def wrapper(self, data: TensorDict, *args, **kwargs):
             if self.enable_routing_replay:
                 tu.assign_non_tensor_data(data, "enable_routing_replay", enabled)
+            if getattr(self, "enable_router_mismatch_metrics", False):
+                capture_enabled = enabled if capture_router_trace is None else capture_router_trace
+                tu.assign_non_tensor_data(data, "capture_router_trace", capture_enabled)
             return func(self, data, *args, **kwargs)
 
         return wrapper
@@ -248,6 +251,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         epochs = tu.pop(data, key="epochs", default=1)
         seed = tu.pop(data, key="seed", default=42)
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+        update_lr_scheduler_at_end = tu.pop(data, key="update_lr_scheduler_at_end", default=True)
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
@@ -295,7 +299,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 tu.assign_non_tensor(
                     mini_batch_td,
                     global_token_num=NonTensorData(global_token_num),
-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
+                    update_lr_scheduler=update_lr_scheduler_at_end and batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
                 actor_output = self.train_batch(mini_batch_td)
@@ -482,6 +486,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             rr_mode = "disabled"
         self.enable_routing_replay = rr_mode != "disabled"
+        router_cfg = self.config.get("router", {})
+        self.enable_router_mismatch_metrics = bool(router_cfg.get("enable_mismatch_metrics", False))
 
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
@@ -569,6 +575,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.actor.ppo_micro_batch_size_per_gpu
             )
             actor_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
+            actor_training_config.engine_config.router_mismatch_metrics_enabled = self.enable_router_mismatch_metrics
 
             if self.config.actor.use_dynamic_bsz:
                 assert self.config.rollout.log_prob_max_token_len_per_gpu is not None
@@ -648,7 +655,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
-    @_with_routing_replay_flag(enabled=True)
+    @_with_routing_replay_flag(enabled=True, capture_router_trace=False)
     def update_actor(self, data: TensorDict) -> TensorDict:
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None

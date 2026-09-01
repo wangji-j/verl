@@ -161,6 +161,9 @@ val_kwargs:
   # Whether to sample during training rollout. False uses greedy sampling.
   do_sample: False
 
+  # Optional validation-only response length. Null reuses rollout.response_length.
+  max_response_length: null
+
 # Multi-turn tool config.
 multi_turn:
 
@@ -346,6 +349,9 @@ skip_tokenizer_init: True
 # Whether to enable rollout routing replay for MoE models
 # When enabled (True), the rollout will record the routing decisions.
 enable_rollout_routing_replay: False
+
+# Whether to ask rollout engines to return per-token routed experts for metrics.
+enable_return_routed_experts: False
 
 
 # profile the rollout model in `generate_sequence`
