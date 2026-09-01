@@ -66,7 +66,7 @@ RECIPE_DIR=${RECIPE_DIR:-"/inspire/hdd/project/qianghuaxuexi/public/verl-low"}
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/inspire/hdd/project/qianghuaxuexi/public"}
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B"}
-CKPTS_DIR=${CKPTS_DIR:-"/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/ckpts/${project_name}/${exp_name}"}
+CKPTS_DIR=${CKPTS_DIR:-"/inspire/hdd3/project/qianghuaxuexi/hujiarui-25046/ckpts/${project_name}/${exp_name}"}
 GSM8K_DIR=${GSM8K_DIR:-"${RAY_DATA_HOME}/datasets/gsm8k"}
 DEEPSCALER_DIR=${DEEPSCALER_DIR:-"${RAY_DATA_HOME}/datasets/deepscaler"}
 TRAIN_FILE=${TRAIN_FILE:-"${DEEPSCALER_DIR}/train.parquet"}
