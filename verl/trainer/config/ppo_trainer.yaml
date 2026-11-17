@@ -90,6 +90,11 @@ router:
   expert_usage_smoothing_tau: 4096.0
   expert_usage_num_experts: null
 
+  # MoE layer indices inside vLLM's per-decoder-layer routed_experts tensor.
+  # null derives them from the HF config (first_k_dense_replace / moe_layer_freq /
+  # mlp_only_layers); needed for dense+MoE models such as DeepSeek-V3 / Moonlight.
+  rollout_moe_layer_indices: null
+
   # Number of router-mismatch steps used to pick the best token alignment from
   # {0, -1, 1}. After warmup, the trainer reuses the frozen alignment.
   mismatch_alignment_warmup_steps: 3

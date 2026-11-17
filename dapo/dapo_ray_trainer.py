@@ -104,6 +104,66 @@ class RayDAPOTrainer(RayPPOTrainer):
                 f"router filtering; got {train_prompt_batch_size} and {mini_prompt_batch_size}."
             )
 
+    def _current_aware_tis_drift_enabled(self) -> bool:
+        """Return whether the probability-drift control arm runs a per-mini-step drop.
+
+        This is the second RDC control arm (the first being random-drop). It reuses
+        the exact off-policy mini-step loop of the current-aware RDC arm -- same
+        rank-major mini-batching, same current theta_(j-1) re-probe per mini-step,
+        same one-optimizer-step-per-mini-step cadence, same "zero response_mask" drop
+        with TIS still correcting every surviving token -- but ranks by
+        rollout-vs-current probability drift instead of router drift. It reads no
+        router routes and is mutually exclusive with RDC.
+        """
+        from verl.experimental.fully_async_policy.tis_drift_ablation import tis_drift_enabled
+
+        return tis_drift_enabled(self.config) and bool(
+            OmegaConf.select(self.config, "tis_drift.off_policy_mini_step", default=False)
+        )
+
+    def _validate_current_aware_tis_drift(self) -> None:
+        """Fail early when the requested probability-drift control cannot mirror RDC."""
+        if not self._current_aware_tis_drift_enabled():
+            return
+
+        if self._current_aware_router_mismatch_rs_enabled():
+            raise ValueError(
+                "tis_drift.off_policy_mini_step=True is an RDC control arm and cannot run with "
+                "router.enable_current_aware_mismatch_rs=True. Enable exactly one."
+            )
+        if self.router_mismatch_metrics_enabled:
+            raise ValueError(
+                "tis_drift.off_policy_mini_step=True is a no-router-signal control; it must run with "
+                "router.enable_mismatch_metrics=False (rollout need not return routed_experts)."
+            )
+        if self._router_mismatch_rs_enabled():
+            raise ValueError(
+                "tis_drift.off_policy_mini_step=True must run with router.enable_mismatch_rs=False."
+            )
+
+        ppo_epochs = int(self.config.actor_rollout_ref.actor.ppo_epochs)
+        if ppo_epochs != 1:
+            raise ValueError(
+                "The probability-drift control defines one current-probe + drop + one optimizer update "
+                f"per PPO mini-step, so actor.ppo_epochs must be 1; got {ppo_epochs}."
+            )
+
+        router_replay_mode = str(self.config.actor_rollout_ref.actor.megatron.router_replay.mode)
+        if router_replay_mode != "disabled":
+            raise ValueError(
+                "The probability-drift control arm runs with R3 off, so "
+                "actor.megatron.router_replay.mode must be 'disabled'; "
+                f"got {router_replay_mode!r}."
+            )
+
+        train_prompt_batch_size = int(self.config.data.train_batch_size)
+        mini_prompt_batch_size = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        if mini_prompt_batch_size <= 0 or train_prompt_batch_size % mini_prompt_batch_size != 0:
+            raise ValueError(
+                "data.train_batch_size must be divisible by actor.ppo_mini_batch_size for the off-policy "
+                f"probability-drift control; got {train_prompt_batch_size} and {mini_prompt_batch_size}."
+            )
+
     @classmethod
     def _rename_current_aware_router_metrics(cls, values: dict, mini_step: int) -> dict:
         """Move the existing static mismatch metrics into an RDC mini-step namespace."""
@@ -318,6 +378,190 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         return DataProto.from_single_dict(data={}, meta_info={"metrics": dict(actor_metrics_across_steps)})
 
+    def _update_actor_with_current_aware_tis_filter(
+        self,
+        batch: DataProto,
+        metrics: dict,
+        timing_raw: dict,
+    ) -> DataProto:
+        """Probe current log-probs, reject the top probability-drift fraction per bucket, then update.
+
+        Byte-for-byte the current-aware RDC loop
+        (``_update_actor_with_current_aware_router_filter``) with one substitution:
+        instead of probing current *routes* and ranking by router mismatch, it probes
+        current *log-probs* (theta_(j-1)) and ranks by the rollout-vs-current
+        probability drift (the same log-ratio TIS truncates). The drop is applied by
+        zeroing ``response_mask`` rows, so every surviving token still receives the
+        TIS correction computed once at theta_0 -- identical to the RDC arm.
+
+        ``old_log_probs`` and TIS weights remain those computed once at the start of
+        the rollout batch. Only the probability-drift comparison is refreshed per
+        mini-step: mini-step ``j`` compares cached rollout log-probs against a free
+        BF16 re-probe under theta_(j-1). Nothing here reads ``routed_experts``.
+        """
+        from verl.experimental.fully_async_policy.tis_drift_ablation import (
+            apply_tis_drift_bucket_drop,
+            compute_tis_drift_seq_score,
+        )
+
+        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+        mini_prompt_batch_size = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        mini_response_batch_size = mini_prompt_batch_size * rollout_n
+        if len(batch) % mini_response_batch_size != 0:
+            raise ValueError(
+                "The response batch must split exactly into PPO mini-batches for the off-policy "
+                f"probability-drift control; got responses={len(batch)}, "
+                f"mini_response_batch_size={mini_response_batch_size}."
+            )
+
+        # Same rank-major mini-batch construction as the RDC arm, so both arms train
+        # on identically composed mini-batches; only the ranking signal differs.
+        actor_dp_size = int(self._get_dp_size(self.actor_rollout_wg, "actor"))
+        if actor_dp_size <= 0 or len(batch) % actor_dp_size != 0:
+            raise ValueError(
+                "The probability-drift response batch must split evenly across actor DP ranks; "
+                f"got responses={len(batch)}, actor_dp_size={actor_dp_size}."
+            )
+        if mini_response_batch_size % actor_dp_size != 0:
+            raise ValueError(
+                "Each probability-drift mini-batch must split evenly across actor DP ranks; "
+                f"got mini_response_batch_size={mini_response_batch_size}, actor_dp_size={actor_dp_size}."
+            )
+        num_mini_steps = len(batch) // mini_response_batch_size
+        responses_per_dp = len(batch) // actor_dp_size
+        mini_responses_per_dp = mini_response_batch_size // actor_dp_size
+        mini_batch_indices = []
+        for mini_step_idx in range(num_mini_steps):
+            mini_indices = []
+            for dp_rank in range(actor_dp_size):
+                start = dp_rank * responses_per_dp + mini_step_idx * mini_responses_per_dp
+                mini_indices.extend(range(start, start + mini_responses_per_dp))
+            mini_batch_indices.append(mini_indices)
+
+        actor_metrics_across_steps: dict[str, list] = defaultdict(list)
+        updated_response_mask = batch.batch["response_mask"].clone()
+        total_rejected = 0.0
+        total_valid = 0.0
+        total_valid_tokens_before = 0.0
+        total_valid_tokens_after = 0.0
+        bucket_count = len(OmegaConf.select(self.config, "tis_drift.length_bucket_edges", default=[]) or []) + 1
+
+        metrics["router/tisdrift/enabled"] = 1.0
+        metrics["router/tisdrift/mini_steps"] = float(num_mini_steps)
+        metrics["router/tisdrift/mini_prompt_batch_size"] = float(mini_prompt_batch_size)
+        metrics["router/tisdrift/mini_response_batch_size"] = float(mini_response_batch_size)
+        metrics["router/tisdrift/actor_dp_size"] = float(actor_dp_size)
+        metrics["router/tisdrift/mini_response_batch_size_per_dp"] = float(mini_responses_per_dp)
+        metrics["router/tisdrift/configured_fraction"] = float(
+            OmegaConf.select(self.config, "tis_drift.fraction", default=0.08)
+        )
+
+        for mini_step, mini_indices in enumerate(mini_batch_indices, start=1):
+            mini_batch = batch[mini_indices]
+            # theta_(j-1) current-route-free probe. We keep the returned log-probs
+            # (the RDC arm keeps only the routes). Do not require routed_experts here.
+            with marked_timer("tisdrift_current_probe", timing_raw, "blue"):
+                current_actor_output, current_actor_mfu = self._compute_old_log_prob(mini_batch)
+            if "old_log_probs" not in current_actor_output.batch:
+                raise RuntimeError(
+                    "Probability-drift filtering did not receive old_log_probs from the current BF16 actor."
+                )
+            probe_log_probs = current_actor_output.batch["old_log_probs"]
+
+            with marked_timer("tisdrift_score", timing_raw, "blue"):
+                seq_score, seq_valid_token_count = compute_tis_drift_seq_score(
+                    mini_batch, self.config, probe_log_probs=probe_log_probs
+                )
+            valid_tokens_before = float(mini_batch.batch["response_mask"].sum().item())
+            with marked_timer("tisdrift_filter", timing_raw, "blue"):
+                filter_metrics = apply_tis_drift_bucket_drop(
+                    mini_batch, self.config, seq_score, seq_valid_token_count
+                )
+            valid_tokens_after = float(mini_batch.batch["response_mask"].sum().item())
+            rejected_tokens = max(valid_tokens_before - valid_tokens_after, 0.0)
+            step_metrics = dict(filter_metrics)
+            step_metrics["current_actor_mfu"] = current_actor_mfu
+            step_metrics["response_count"] = float(len(mini_batch))
+            metrics.update(self._rename_current_aware_router_metrics(step_metrics, mini_step))
+
+            rejected = float(filter_metrics.get("tis_drift/rejected_count", 0.0))
+            kept = float(filter_metrics.get("tis_drift/kept_count", 0.0))
+            valid_responses = rejected + kept
+            actual_rejected_fraction = rejected / valid_responses if valid_responses > 0 else 0.0
+            total_rejected += rejected
+            total_valid += valid_responses
+            total_valid_tokens_before += valid_tokens_before
+            total_valid_tokens_after += valid_tokens_after
+            step_filter_prefix = f"router/tisdrift/mini_step_{mini_step}/filter"
+            step_filter_summary = {
+                f"{step_filter_prefix}/total_response_count": float(len(mini_batch)),
+                f"{step_filter_prefix}/valid_response_count": valid_responses,
+                f"{step_filter_prefix}/filtered_response_count": rejected,
+                f"{step_filter_prefix}/rejected_response_count": rejected,
+                f"{step_filter_prefix}/kept_response_count": kept,
+                f"{step_filter_prefix}/actual_rejected_fraction": actual_rejected_fraction,
+                f"{step_filter_prefix}/configured_fraction": self._tis_drift_fraction(),
+                f"{step_filter_prefix}/valid_token_count_before": valid_tokens_before,
+                f"{step_filter_prefix}/valid_token_count_after": valid_tokens_after,
+                f"{step_filter_prefix}/rejected_token_count": rejected_tokens,
+                f"{step_filter_prefix}/rejected_token_fraction": (
+                    rejected_tokens / valid_tokens_before if valid_tokens_before > 0 else 0.0
+                ),
+            }
+            for bucket_idx in range(bucket_count):
+                source_prefix = f"tis_drift/bucket_{bucket_idx}"
+                bucket_totals_count = float(filter_metrics.get(f"{source_prefix}_count", 0.0))
+                bucket_totals_rejected = float(filter_metrics.get(f"{source_prefix}_rejected_count", 0.0))
+                step_filter_summary[f"{step_filter_prefix}/bucket_{bucket_idx}_count"] = bucket_totals_count
+                step_filter_summary[f"{step_filter_prefix}/bucket_{bucket_idx}_rejected_count"] = (
+                    bucket_totals_rejected
+                )
+
+            # The probe's log-probs are not a PPO anchor. Release before backward.
+            del current_actor_output, probe_log_probs, seq_score
+
+            updated_response_mask[mini_indices] = mini_batch.batch["response_mask"]
+            mini_batch.batch.pop("tis_drift_reject_mask", None)
+            # One RPC per mini-step; suppress LR scheduler advancement until the last.
+            mini_batch.meta_info["update_lr_scheduler_at_end"] = mini_step == num_mini_steps
+
+            with marked_timer("tisdrift_actor_update", timing_raw, "red"):
+                actor_output = self._update_actor(mini_batch)
+            metrics.update(step_filter_summary)
+            step_prefix = f"router/tisdrift/mini_step_{mini_step}"
+            metrics[f"{step_prefix}/update_completed"] = 1.0
+            metrics[f"{step_prefix}/cumulative_filtered_response_count"] = total_rejected
+            metrics[f"{step_prefix}/cumulative_valid_response_count"] = total_valid
+            metrics[f"{step_prefix}/cumulative_actual_rejected_fraction"] = (
+                total_rejected / total_valid if total_valid > 0 else 0.0
+            )
+            cumulative_rejected_tokens = total_valid_tokens_before - total_valid_tokens_after
+            metrics[f"{step_prefix}/cumulative_rejected_token_count"] = cumulative_rejected_tokens
+            metrics[f"{step_prefix}/cumulative_rejected_token_fraction"] = (
+                cumulative_rejected_tokens / total_valid_tokens_before if total_valid_tokens_before > 0 else 0.0
+            )
+            step_actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+            for key, value in step_actor_metrics.items():
+                actor_metrics_across_steps[key].append(value)
+
+        batch.batch["response_mask"] = updated_response_mask
+        metrics["router/tisdrift/rejected_count"] = total_rejected
+        metrics["router/tisdrift/valid_response_count"] = total_valid
+        metrics["router/tisdrift/rejected_fraction"] = total_rejected / total_valid if total_valid > 0 else 0.0
+        metrics["router/tisdrift/valid_token_count_before"] = total_valid_tokens_before
+        metrics["router/tisdrift/valid_token_count_after"] = total_valid_tokens_after
+        metrics["router/tisdrift/rejected_token_count"] = total_valid_tokens_before - total_valid_tokens_after
+        metrics["router/tisdrift/rejected_token_fraction"] = (
+            (total_valid_tokens_before - total_valid_tokens_after) / total_valid_tokens_before
+            if total_valid_tokens_before > 0
+            else 0.0
+        )
+
+        return DataProto.from_single_dict(data={}, meta_info={"metrics": dict(actor_metrics_across_steps)})
+
+    def _tis_drift_fraction(self) -> float:
+        return float(OmegaConf.select(self.config, "tis_drift.fraction", default=0.08))
+
     def _reward_extract_debug_enabled(self) -> bool:
         return bool(os.getenv("VERL_REWARD_DEBUG_DIR", "").strip())
 
@@ -426,274 +670,6 @@ class RayDAPOTrainer(RayPPOTrainer):
             for row in rows:
                 f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
-    def _router_analysis_dump_dir(self) -> str:
-        return os.getenv("VERL_ROUTER_ANALYSIS_DUMP_DIR", "").strip()
-
-    def _router_analysis_dump_mode(self) -> str:
-        return os.getenv("VERL_ROUTER_ANALYSIS_DUMP_MODE", "summary").strip().lower()
-
-    def _router_analysis_dump_float_dtype(self) -> torch.dtype:
-        dtype = os.getenv("VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE", "float16").strip().lower()
-        if dtype in {"bf16", "bfloat16"}:
-            return torch.bfloat16
-        if dtype in {"fp32", "float32"}:
-            return torch.float32
-        return torch.float16
-
-    def _router_analysis_dump_topk_tokens(self) -> int:
-        return max(int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS", "32") or 32), 0)
-
-    def _should_dump_router_analysis(self, global_step: int) -> bool:
-        if self._router_analysis_dump_mode() in {"", "0", "false", "off", "none", "disable", "disabled"}:
-            return False
-        if not self._router_analysis_dump_dir():
-            return False
-        max_steps = int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_STEPS", "0") or 0)
-        if max_steps > 0 and global_step >= max_steps:
-            return False
-        every_n = max(int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_EVERY_N", "1") or 1), 1)
-        return global_step % every_n == 0
-
-    @staticmethod
-    def _tensor_to_cpu(tensor: torch.Tensor | None, *, dtype: torch.dtype | None = None) -> torch.Tensor | None:
-        if tensor is None:
-            return None
-        tensor = tensor.detach()
-        if dtype is not None:
-            tensor = tensor.to(dtype=dtype)
-        return tensor.cpu()
-
-    def _maybe_dump_router_analysis(self, batch: DataProto, old_log_prob: DataProto, router_result) -> None:
-        global_step = int(getattr(self, "global_steps", -1))
-        if router_result is None or not self._should_dump_router_analysis(global_step):
-            return
-
-        mode = self._router_analysis_dump_mode()
-        if mode not in {"summary", "tokens", "sample", "full", "expert_counts"}:
-            raise ValueError(
-                "VERL_ROUTER_ANALYSIS_DUMP_MODE must be one of summary, tokens, sample, full, expert_counts; "
-                f"got {mode!r}"
-            )
-
-        dump_dir = self._router_analysis_dump_dir()
-        os.makedirs(dump_dir, exist_ok=True)
-        float_dtype = self._router_analysis_dump_float_dtype()
-        responses = batch.batch.get("responses")
-        attention_mask = batch.batch.get("attention_mask")
-        if responses is not None and attention_mask is not None:
-            response_mask = attention_mask[:, -responses.shape[-1] :].bool()
-        else:
-            response_mask = batch.batch["response_mask"].bool()
-        rs_reject_mask = batch.batch.get("router_mismatch_reject_mask")
-        old_log_probs = old_log_prob.batch.get("old_log_probs")
-        rollout_log_probs = batch.batch.get("rollout_log_probs")
-
-        seq_valid_token_count = router_result.seq_valid_token_count
-        seq_mismatch = router_result.seq_mismatch
-        token_mismatch = router_result.token_mismatch
-
-        with torch.no_grad():
-            seq_prob_diff = None
-            seq_logprob_diff = None
-            prob_diff = None
-            logprob_diff = None
-            if old_log_probs is not None and rollout_log_probs is not None:
-                mask = response_mask.to(device=old_log_probs.device)
-                rollout_log_probs = rollout_log_probs.to(device=old_log_probs.device)
-                valid_count = mask.float().sum(dim=-1).clamp_min(1.0)
-                prob_diff = (old_log_probs.float().exp() - rollout_log_probs.float().exp()).abs()
-                logprob_diff = (old_log_probs.float() - rollout_log_probs.float()).abs()
-                seq_prob_diff = (prob_diff * mask.float()).sum(dim=-1) / valid_count
-                seq_logprob_diff = (logprob_diff * mask.float()).sum(dim=-1) / valid_count
-
-            token_level_scores = batch.batch.get("token_level_scores")
-            seq_reward = token_level_scores.sum(dim=-1) if token_level_scores is not None else None
-            extreme_tokens = None
-            topk_tokens = self._router_analysis_dump_topk_tokens()
-            if topk_tokens > 0 and token_mismatch is not None:
-                mismatch_scores = token_mismatch.float()
-                valid_mask = response_mask.to(device=mismatch_scores.device)
-                scored = mismatch_scores.masked_fill(~valid_mask, float("-inf"))
-                k = min(topk_tokens, scored.shape[-1])
-                top_values, top_indices = torch.topk(scored, k=k, dim=-1, largest=True, sorted=True)
-                top_valid = torch.isfinite(top_values)
-                extreme_tokens = {
-                    "topk": k,
-                    "indices": self._tensor_to_cpu(top_indices, dtype=torch.int32),
-                    "valid": self._tensor_to_cpu(top_valid),
-                    "token_mismatch": self._tensor_to_cpu(top_values.masked_fill(~top_valid, 0.0), dtype=float_dtype),
-                }
-                if responses is not None:
-                    response_ids = responses.to(device=top_indices.device)
-                    extreme_tokens["token_ids"] = self._tensor_to_cpu(
-                        torch.gather(response_ids, dim=-1, index=top_indices.clamp_min(0)),
-                        dtype=torch.int32,
-                    )
-                if old_log_probs is not None:
-                    old_on_topk = old_log_probs.to(device=top_indices.device)
-                    extreme_tokens["old_log_probs"] = self._tensor_to_cpu(
-                        torch.gather(old_on_topk, dim=-1, index=top_indices.clamp_min(0)),
-                        dtype=float_dtype,
-                    )
-                if rollout_log_probs is not None:
-                    rollout_on_topk = rollout_log_probs.to(device=top_indices.device)
-                    extreme_tokens["rollout_log_probs"] = self._tensor_to_cpu(
-                        torch.gather(rollout_on_topk, dim=-1, index=top_indices.clamp_min(0)),
-                        dtype=float_dtype,
-                    )
-                if prob_diff is not None:
-                    prob_diff_on_topk = prob_diff.to(device=top_indices.device)
-                    extreme_tokens["prob_diff"] = self._tensor_to_cpu(
-                        torch.gather(prob_diff_on_topk, dim=-1, index=top_indices.clamp_min(0)),
-                        dtype=float_dtype,
-                    )
-                if logprob_diff is not None:
-                    logprob_diff_on_topk = logprob_diff.to(device=top_indices.device)
-                    extreme_tokens["logprob_diff"] = self._tensor_to_cpu(
-                        torch.gather(logprob_diff_on_topk, dim=-1, index=top_indices.clamp_min(0)),
-                        dtype=float_dtype,
-                    )
-            extreme_prob_diff_tokens = None
-            if topk_tokens > 0 and prob_diff is not None:
-                valid_mask = response_mask.to(device=prob_diff.device)
-                scored = prob_diff.float().masked_fill(~valid_mask, float("-inf"))
-                k = min(topk_tokens, scored.shape[-1])
-                top_values, top_indices = torch.topk(scored, k=k, dim=-1, largest=True, sorted=True)
-                top_valid = torch.isfinite(top_values)
-                extreme_prob_diff_tokens = {
-                    "topk": k,
-                    "indices": self._tensor_to_cpu(top_indices, dtype=torch.int32),
-                    "valid": self._tensor_to_cpu(top_valid),
-                    "prob_diff": self._tensor_to_cpu(top_values.masked_fill(~top_valid, 0.0), dtype=float_dtype),
-                }
-                if responses is not None:
-                    response_ids = responses.to(device=top_indices.device)
-                    extreme_prob_diff_tokens["token_ids"] = self._tensor_to_cpu(
-                        torch.gather(response_ids, dim=-1, index=top_indices.clamp_min(0)),
-                        dtype=torch.int32,
-                    )
-                if token_mismatch is not None:
-                    mismatch_on_topk = token_mismatch.to(device=top_indices.device)
-                    extreme_prob_diff_tokens["token_mismatch"] = self._tensor_to_cpu(
-                        torch.gather(mismatch_on_topk, dim=-1, index=top_indices.clamp_min(0)),
-                        dtype=float_dtype,
-                    )
-                if old_log_probs is not None:
-                    old_on_topk = old_log_probs.to(device=top_indices.device)
-                    extreme_prob_diff_tokens["old_log_probs"] = self._tensor_to_cpu(
-                        torch.gather(old_on_topk, dim=-1, index=top_indices.clamp_min(0)),
-                        dtype=float_dtype,
-                    )
-                if rollout_log_probs is not None:
-                    rollout_on_topk = rollout_log_probs.to(device=top_indices.device)
-                    extreme_prob_diff_tokens["rollout_log_probs"] = self._tensor_to_cpu(
-                        torch.gather(rollout_on_topk, dim=-1, index=top_indices.clamp_min(0)),
-                        dtype=float_dtype,
-                    )
-                if logprob_diff is not None:
-                    logprob_diff_on_topk = logprob_diff.to(device=top_indices.device)
-                    extreme_prob_diff_tokens["logprob_diff"] = self._tensor_to_cpu(
-                        torch.gather(logprob_diff_on_topk, dim=-1, index=top_indices.clamp_min(0)),
-                        dtype=float_dtype,
-                    )
-
-            payload = {
-                "metadata": {
-                    "global_step": global_step,
-                    "mode": mode,
-                    "alignment": int(router_result.alignment),
-                    "alignment_scores": router_result.alignment_scores,
-                    "batch_size": int(batch.batch.batch_size[0]) if batch.batch is not None else 0,
-                    "response_mask_shape": list(response_mask.shape),
-                    "response_mask_tokens": int(response_mask.sum().item()),
-                    "float_dtype": str(float_dtype),
-                    "extreme_token_topk": topk_tokens,
-                    "rollout_routes_shape": list(batch.batch["routed_experts"].shape)
-                    if "routed_experts" in batch.batch
-                    else None,
-                    "train_routes_shape": list(old_log_prob.batch["routed_experts"].shape)
-                    if "routed_experts" in old_log_prob.batch
-                    else None,
-                    "rollout_routes_dtype": str(batch.batch["routed_experts"].dtype)
-                    if "routed_experts" in batch.batch
-                    else None,
-                    "train_routes_dtype": str(old_log_prob.batch["routed_experts"].dtype)
-                    if "routed_experts" in old_log_prob.batch
-                    else None,
-                    "metric_names": sorted(router_result.metrics.keys()),
-                },
-                "metrics": dict(router_result.metrics),
-                "response_summary": {
-                    "seq_mismatch": self._tensor_to_cpu(seq_mismatch, dtype=torch.float32),
-                    "seq_valid_token_count": self._tensor_to_cpu(seq_valid_token_count, dtype=torch.float32),
-                    "seq_prob_diff": self._tensor_to_cpu(seq_prob_diff, dtype=torch.float32),
-                    "seq_logprob_diff": self._tensor_to_cpu(seq_logprob_diff, dtype=torch.float32),
-                    "seq_reward": self._tensor_to_cpu(seq_reward, dtype=torch.float32),
-                    "rs_reject_mask": self._tensor_to_cpu(rs_reject_mask),
-                    "extreme_tokens": extreme_tokens,
-                    "extreme_prob_diff_tokens": extreme_prob_diff_tokens,
-                    "expert_usage_distances": {
-                        name: self._tensor_to_cpu(values, dtype=torch.float32)
-                        for name, values in (router_result.expert_usage_distances or {}).items()
-                    },
-                },
-            }
-
-            uids = batch.non_tensor_batch.get("uid") if hasattr(batch, "non_tensor_batch") else None
-            if uids is not None:
-                payload["uids"] = [str(uid) for uid in uids]
-
-            if mode in {"tokens", "sample", "full"}:
-                payload["token_data"] = {
-                    "responses": self._tensor_to_cpu(responses, dtype=torch.int32),
-                    "response_mask": self._tensor_to_cpu(response_mask),
-                    "attention_mask": self._tensor_to_cpu(attention_mask),
-                    "token_mismatch": self._tensor_to_cpu(token_mismatch, dtype=float_dtype),
-                    "old_log_probs": self._tensor_to_cpu(old_log_probs, dtype=float_dtype),
-                    "rollout_log_probs": self._tensor_to_cpu(rollout_log_probs, dtype=float_dtype),
-                    "logprob_delta": self._tensor_to_cpu(
-                        old_log_probs.float() - rollout_log_probs.float()
-                        if old_log_probs is not None and rollout_log_probs is not None
-                        else None,
-                        dtype=float_dtype,
-                    ),
-                    "logprob_diff": self._tensor_to_cpu(logprob_diff, dtype=float_dtype),
-                    "prob_diff": self._tensor_to_cpu(prob_diff, dtype=float_dtype),
-                }
-
-            if mode in {"sample", "full"}:
-                route_limit = int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_SAMPLES", "16") or 16)
-                route_count = int(response_mask.shape[0]) if mode == "full" else min(route_limit, int(response_mask.shape[0]))
-                route_slice = slice(0, route_count)
-                payload["routed_experts"] = {
-                    "sample_count": route_count,
-                    "rollout": self._tensor_to_cpu(batch.batch["routed_experts"][route_slice])
-                    if "routed_experts" in batch.batch
-                    else None,
-                    "train": self._tensor_to_cpu(old_log_prob.batch["routed_experts"][route_slice])
-                    if "routed_experts" in old_log_prob.batch
-                    else None,
-                }
-
-            if mode == "expert_counts":
-                if router_result.expert_usage_counts is None:
-                    raise RuntimeError(
-                        "expert_counts dump mode requires per-response expert counts, but none were captured"
-                    )
-                payload["expert_usage"] = {
-                    "distances_by_layer": {
-                        name: self._tensor_to_cpu(values, dtype=float_dtype)
-                        for name, values in (router_result.expert_usage_distances_by_layer or {}).items()
-                    },
-                    "counts": {
-                        side: self._tensor_to_cpu(values)
-                        for side, values in router_result.expert_usage_counts.items()
-                    },
-                }
-
-        path = os.path.join(dump_dir, f"router_analysis_step{global_step:04d}_pid{os.getpid()}.pt")
-        torch.save(payload, path)
-
     def compute_kl_related_metrics(self, batch: DataProto, metrics: dict, timing_raw: dict):
         batch.batch["response_mask"] = compute_response_mask(batch)
 
@@ -761,7 +737,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                         + ", ".join(missing_routed_experts)
                     )
                 with marked_timer("router_mismatch_metrics", timing_raw, "blue"):
-                    router_result = self._compute_router_mismatch_result(batch, old_log_prob)
+                    router_result = self._compute_router_mismatch_result(batch, old_log_prob, capture_for_dump=True)
                 if router_result is not None:
                     metrics.update(router_result.metrics)
                     # Static RS compares rollout routes with theta_0 once for the
@@ -805,6 +781,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         from verl.utils.tracking import Tracking
 
         self._validate_current_aware_router_mismatch_rs()
+        self._validate_current_aware_tis_drift()
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -1126,6 +1103,12 @@ class RayDAPOTrainer(RayPPOTrainer):
                         with marked_timer("update_actor", timing_raw, "red"):
                             if self._current_aware_router_mismatch_rs_enabled():
                                 actor_output = self._update_actor_with_current_aware_router_filter(
+                                    batch,
+                                    metrics,
+                                    timing_raw,
+                                )
+                            elif self._current_aware_tis_drift_enabled():
+                                actor_output = self._update_actor_with_current_aware_tis_filter(
                                     batch,
                                     metrics,
                                     timing_raw,

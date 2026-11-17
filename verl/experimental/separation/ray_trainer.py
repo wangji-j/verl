@@ -548,6 +548,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                         rs_metrics = self._apply_router_mismatch_rs(batch, router_result)
                         if rs_metrics:
                             metrics.update(rs_metrics)
+                        # Off unless VERL_ROUTER_ANALYSIS_DUMP_DIR is set (gated by DUMP_EVERY_N/STEPS).
+                        self._maybe_dump_router_analysis(batch, old_log_prob, router_result)
                     if router_mode == "R2":
                         batch.batch.pop("routed_experts")
                     else:

@@ -1,0 +1,365 @@
+{
+  "files": 129,
+  "definition": {
+    "observation": "one probe at one lag for one reference arm",
+    "gross": "flip_rate: fraction of token-layer top-k sets that changed",
+    "overlap": "overlap_mismatch: replaced-slot fraction",
+    "raw_net": "mean layer TV of expert counts",
+    "net": "d_route (tau adjusted)",
+    "main_excludes_lag0": true,
+    "bottom_decile": "raw_net <= pooled empirical 10th percentile, including ties",
+    "caveat": "Zero layer counts do not identify layer rerouting. Repeated probes/lags are dependent. Gross drift is not evidence of training harm."
+  },
+  "checks": {
+    "mu": {
+      "countsum_bad_ref": 0,
+      "countsum_bad_cur": 0,
+      "raw_recompute_max_abs_error": 3.230610386845134e-09,
+      "raw_recompute_bad_atol_1e-6": 0,
+      "nonpositive_valid_tokens": 0,
+      "ranges": {
+        "d_route": {
+          "min": 0.004468804690986872,
+          "max": 0.012149461545050144,
+          "nonfinite": 0
+        },
+        "d_route_raw": {
+          "min": 0.004580530803650618,
+          "max": 0.019954387098550797,
+          "nonfinite": 0
+        },
+        "flip_rate": {
+          "min": 0.16794541478157043,
+          "max": 0.36647844314575195,
+          "nonfinite": 0
+        },
+        "overlap_mismatch": {
+          "min": 0.02238408476114273,
+          "max": 0.05607616901397705,
+          "nonfinite": 0
+        },
+        "valid_tokens": {
+          "min": 638.0,
+          "max": 20479.0,
+          "nonfinite": 0
+        },
+        "logprob": {
+          "min": 0.015490956604480743,
+          "max": 0.15386849641799927,
+          "nonfinite": 0
+        },
+        "lengths": {
+          "min": 638.0,
+          "max": 20480.0,
+          "nonfinite": 0
+        },
+        "ref_counts": {
+          "min": 0.0,
+          "max": 18389.0,
+          "nonfinite": 0
+        },
+        "cur_counts": {
+          "min": 0.0,
+          "max": 18421.0,
+          "nonfinite": 0
+        }
+      }
+    },
+    "pi0": {
+      "countsum_bad_ref": 0,
+      "countsum_bad_cur": 0,
+      "raw_recompute_max_abs_error": 2.5400060665869972e-09,
+      "raw_recompute_bad_atol_1e-6": 0,
+      "nonpositive_valid_tokens": 0,
+      "ranges": {
+        "d_route": {
+          "min": 0.0014198116259649396,
+          "max": 0.009661700576543808,
+          "nonfinite": 0
+        },
+        "d_route_raw": {
+          "min": 0.0014553070068359375,
+          "max": 0.01576874777674675,
+          "nonfinite": 0
+        },
+        "flip_rate": {
+          "min": 0.09261474758386612,
+          "max": 0.28317126631736755,
+          "nonfinite": 0
+        },
+        "overlap_mismatch": {
+          "min": 0.012177403084933758,
+          "max": 0.04226461052894592,
+          "nonfinite": 0
+        },
+        "valid_tokens": {
+          "min": 638.0,
+          "max": 20480.0,
+          "nonfinite": 0
+        },
+        "logprob": {
+          "min": 0.008351817727088928,
+          "max": 0.14022639393806458,
+          "nonfinite": 0
+        },
+        "lengths": {
+          "min": 638.0,
+          "max": 20480.0,
+          "nonfinite": 0
+        },
+        "ref_counts": {
+          "min": 0.0,
+          "max": 18399.0,
+          "nonfinite": 0
+        },
+        "cur_counts": {
+          "min": 0.0,
+          "max": 18421.0,
+          "nonfinite": 0
+        }
+      }
+    }
+  },
+  "arms": {
+    "mu": {
+      "observations": 32720,
+      "unique_probes": 256,
+      "unique_lags": 128,
+      "exact_zero_count": 0,
+      "exact_zero_positive_gross_count": 0,
+      "zero_layers": 0,
+      "total_layers": 1570560,
+      "bottom_decile_raw_net_threshold": 0.006210545683279634,
+      "exact_zero_rate": 0.0,
+      "exact_zero_positive_gross_rate": 0.0,
+      "zero_layer_rate": 0.0,
+      "groups": {
+        "overall": {
+          "n": 32720,
+          "raw_net_mean": 0.008953063632560834,
+          "raw_net_median": 0.008397223427891731,
+          "raw_net_p90": 0.012758868001401425,
+          "net_mean": 0.007633720306323245,
+          "net_median": 0.007606270490214229,
+          "net_p90": 0.009462272096425296,
+          "gross_mean": 0.23618024076747282,
+          "gross_median": 0.23108191788196564,
+          "gross_p90": 0.27804023325443267,
+          "overlap_mean": 0.03355937513686753,
+          "overlap_median": 0.03251006454229355,
+          "overlap_p90": 0.040933590754866606,
+          "logprob_mean": 0.057560383404484404,
+          "logprob_median": 0.051910990849137306,
+          "logprob_p90": 0.09123529419302946,
+          "overlap_gt_0.1_rate": 0.0
+        },
+        "raw_net<=0.001": {
+          "n": 0
+        },
+        "raw_net<=0.005": {
+          "n": 121,
+          "raw_net_mean": 0.004849115278848932,
+          "raw_net_median": 0.0048545231111347675,
+          "raw_net_p90": 0.00498264329507947,
+          "net_mean": 0.004714751396759236,
+          "net_median": 0.004721394740045071,
+          "net_p90": 0.004836273845285177,
+          "gross_mean": 0.17779358753488084,
+          "gross_median": 0.17851176857948303,
+          "gross_p90": 0.1839231699705124,
+          "overlap_mean": 0.023770387523060987,
+          "overlap_median": 0.023618578910827637,
+          "overlap_p90": 0.02516869455575943,
+          "logprob_mean": 0.0496621176231006,
+          "logprob_median": 0.048653893172740936,
+          "logprob_p90": 0.05925929546356201,
+          "overlap_gt_0.1_rate": 0.0
+        },
+        "raw_net<=0.01": {
+          "n": 23936,
+          "raw_net_mean": 0.007662035738960603,
+          "raw_net_median": 0.007647263118997216,
+          "raw_net_p90": 0.009415955748409033,
+          "net_mean": 0.007066625872559043,
+          "net_median": 0.007085630437359214,
+          "net_p90": 0.008378731086850166,
+          "gross_mean": 0.22301704204394757,
+          "gross_median": 0.2228037416934967,
+          "gross_p90": 0.2464594542980194,
+          "overlap_mean": 0.031268732298544065,
+          "overlap_median": 0.031311582773923874,
+          "overlap_p90": 0.03517795726656914,
+          "logprob_mean": 0.06127112492748392,
+          "logprob_median": 0.05541543290019035,
+          "logprob_p90": 0.09620903804898262,
+          "overlap_gt_0.1_rate": 0.0
+        },
+        "bottom_decile": {
+          "n": 3272,
+          "raw_net_mean": 0.005714888370500235,
+          "raw_net_median": 0.005772266536951065,
+          "raw_net_p90": 0.006133669894188643,
+          "net_mean": 0.005485777674990872,
+          "net_median": 0.005536602111533284,
+          "net_p90": 0.005858288519084454,
+          "gross_mean": 0.19975594411123646,
+          "gross_median": 0.19852141290903091,
+          "gross_p90": 0.21714588701725007,
+          "overlap_mean": 0.02742833472061948,
+          "overlap_median": 0.027388039976358414,
+          "overlap_p90": 0.03081108406186104,
+          "logprob_mean": 0.053240403923499775,
+          "logprob_median": 0.05157649703323841,
+          "logprob_p90": 0.0689361147582531,
+          "overlap_gt_0.1_rate": 0.0
+        }
+      },
+      "correlations": {
+        "raw_net__gross": {
+          "pearson": 0.8856466835154091,
+          "spearman": 0.8617286945674612
+        },
+        "raw_net__overlap": {
+          "pearson": 0.8554386652813288,
+          "spearman": 0.8325222415486904
+        },
+        "raw_net__logprob": {
+          "pearson": -0.17074673030219975,
+          "spearman": -0.18017020062248096
+        },
+        "net__gross": {
+          "pearson": 0.8595504546065716,
+          "spearman": 0.853501105547991
+        },
+        "net__overlap": {
+          "pearson": 0.8154815239853517,
+          "spearman": 0.8069660858524554
+        },
+        "net__logprob": {
+          "pearson": 0.08852100912465588,
+          "spearman": 0.01151392488949166
+        }
+      }
+    },
+    "pi0": {
+      "observations": 32720,
+      "unique_probes": 256,
+      "unique_lags": 128,
+      "exact_zero_count": 0,
+      "exact_zero_positive_gross_count": 0,
+      "zero_layers": 0,
+      "total_layers": 1570560,
+      "bottom_decile_raw_net_threshold": 0.003450935217551887,
+      "exact_zero_rate": 0.0,
+      "exact_zero_positive_gross_rate": 0.0,
+      "zero_layer_rate": 0.0,
+      "groups": {
+        "overall": {
+          "n": 32720,
+          "raw_net_mean": 0.006297824072098948,
+          "raw_net_median": 0.0060244775377213955,
+          "raw_net_p90": 0.009629892650991678,
+          "net_mean": 0.005332946251781229,
+          "net_median": 0.0054069217294454575,
+          "net_p90": 0.007264358084648848,
+          "gross_mean": 0.16385694504817971,
+          "gross_median": 0.16051383316516876,
+          "gross_p90": 0.20237778574228288,
+          "overlap_mean": 0.023087718678196586,
+          "overlap_median": 0.022486007772386074,
+          "overlap_p90": 0.029525419883430007,
+          "logprob_mean": 0.047756436648938014,
+          "logprob_median": 0.041043346747756004,
+          "logprob_p90": 0.08293649926781654,
+          "overlap_gt_0.1_rate": 0.0
+        },
+        "raw_net<=0.001": {
+          "n": 0
+        },
+        "raw_net<=0.005": {
+          "n": 10456,
+          "raw_net_mean": 0.003823818720253409,
+          "raw_net_median": 0.003946225857362151,
+          "raw_net_p90": 0.0048109060153365135,
+          "net_mean": 0.003609392191694911,
+          "net_median": 0.003724128007888794,
+          "net_p90": 0.0045074583031237125,
+          "gross_mean": 0.13769504182288664,
+          "gross_median": 0.138340026140213,
+          "gross_p90": 0.15492215752601624,
+          "overlap_mean": 0.019049980796128227,
+          "overlap_median": 0.019132615998387337,
+          "overlap_p90": 0.021942615509033203,
+          "logprob_mean": 0.04162975547911119,
+          "logprob_median": 0.03861978091299534,
+          "logprob_p90": 0.06241610459983349,
+          "overlap_gt_0.1_rate": 0.0
+        },
+        "raw_net<=0.01": {
+          "n": 29961,
+          "raw_net_mean": 0.0058071021755669505,
+          "raw_net_median": 0.005792821291834116,
+          "raw_net_p90": 0.008324308320879936,
+          "net_mean": 0.005114887034558617,
+          "net_median": 0.005238024052232504,
+          "net_p90": 0.006812021601945162,
+          "gross_mean": 0.15890686506537458,
+          "gross_median": 0.15770339965820312,
+          "gross_p90": 0.1898909956216812,
+          "overlap_mean": 0.022298968092421757,
+          "overlap_median": 0.022065095603466034,
+          "overlap_p90": 0.027362747117877007,
+          "logprob_mean": 0.04854537918327531,
+          "logprob_median": 0.041375983506441116,
+          "logprob_p90": 0.08521340787410736,
+          "overlap_gt_0.1_rate": 0.0
+        },
+        "bottom_decile": {
+          "n": 3272,
+          "raw_net_mean": 0.002814855991512899,
+          "raw_net_median": 0.0028919167816638947,
+          "raw_net_p90": 0.0033458702033385634,
+          "net_mean": 0.002691274051000034,
+          "net_median": 0.0027559372829273343,
+          "net_p90": 0.003182283299975097,
+          "gross_mean": 0.1261962873332913,
+          "gross_median": 0.12684932351112366,
+          "gross_p90": 0.14194998443126677,
+          "overlap_mean": 0.017283529261796573,
+          "overlap_median": 0.017362319864332676,
+          "overlap_p90": 0.019839903339743614,
+          "logprob_mean": 0.03513185350875618,
+          "logprob_median": 0.033954789862036705,
+          "logprob_p90": 0.047239321097731594,
+          "overlap_gt_0.1_rate": 0.0
+        }
+      },
+      "correlations": {
+        "raw_net__gross": {
+          "pearson": 0.8939164083332833,
+          "spearman": 0.8861270913151487
+        },
+        "raw_net__overlap": {
+          "pearson": 0.8654937918525336,
+          "spearman": 0.8593392720119619
+        },
+        "raw_net__logprob": {
+          "pearson": 0.006925643131135124,
+          "spearman": 0.032475183037039945
+        },
+        "net__gross": {
+          "pearson": 0.8759958891694472,
+          "spearman": 0.887067199568825
+        },
+        "net__overlap": {
+          "pearson": 0.8339774821767746,
+          "spearman": 0.8453174026293498
+        },
+        "net__logprob": {
+          "pearson": 0.2530951833698416,
+          "spearman": 0.21928092422667445
+        }
+      }
+    }
+  }
+}

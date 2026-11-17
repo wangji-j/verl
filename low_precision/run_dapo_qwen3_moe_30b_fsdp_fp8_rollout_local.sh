@@ -14,7 +14,7 @@ export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
-export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
+export WANDB_API_KEY=${WANDB_API_KEY:-}
 export WANDB_MODE=${WANDB_MODE:-online}
 
 run_timestamp=${RUN_TIMESTAMP:-$(date +"%Y%m%d_%H%M%S")}

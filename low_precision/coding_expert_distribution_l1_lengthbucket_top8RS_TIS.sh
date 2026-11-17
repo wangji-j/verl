@@ -22,7 +22,7 @@ export VERL_REWARD_WORKER_MAX_CONCURRENCY=${VERL_REWARD_WORKER_MAX_CONCURRENCY:-
 export VERL_CODE_EVAL_MAX_MEMORY_GB=${VERL_CODE_EVAL_MAX_MEMORY_GB:-16}
 export DAPO_TASK_RUNNER_NUM_CPUS=${DAPO_TASK_RUNNER_NUM_CPUS:-64}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
-export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
+export WANDB_API_KEY=${WANDB_API_KEY:-}
 export WANDB_MODE=${WANDB_MODE:-online}
 export NVTE_FP8_BLOCK_SCALING_FP32_SCALES=${NVTE_FP8_BLOCK_SCALING_FP32_SCALES:-1}
 
@@ -36,12 +36,14 @@ adv_estimator=grpo
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=True
-kl_loss_coef=${KL_LOSS_COEF:-0.001}
+# KL off to match the math-series ablation protocol: stability must be
+# attributable to the correction method (RDC/TIS), not a KL anchor.
+use_kl_loss=${USE_KL_LOSS:-False}
+kl_loss_coef=${KL_LOSS_COEF:-0.0}
 kl_loss_type=${KL_LOSS_TYPE:-low_var_kl}
 
 clip_ratio_low=0.2
-clip_ratio_high=0.27
+clip_ratio_high=0.28
 
 rollout_is=token
 rollout_is_threshold=2.0
@@ -62,17 +64,23 @@ router_expert_usage_num_experts=${ROUTER_EXPERT_USAGE_NUM_EXPERTS:-null}
 
 max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
 max_response_length=${MAX_RESPONSE_LENGTH:-32000}
-val_max_response_length=${VAL_MAX_RESPONSE_LENGTH:-32768}
-rollout_max_model_len=$((max_prompt_length + val_max_response_length))
+# Qwen3-30B-A3B max_position_embeddings is 32768: the model window must hold
+# prompt + generation, so validation generation caps at 32768 - 4096 = 28672.
+# (The old 32768 val budget made max_model_len 36864 and vLLM refuses to boot.)
+val_max_response_length=${VAL_MAX_RESPONSE_LENGTH:-28672}
+rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-32768}
 enable_overlong_buffer=False
 overlong_buffer_len=512
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
-enable_filter_groups=False
+# DeepCoder/Seed-Coder-style dynamic sampling: drop all-pass/all-fail groups
+# online so binary-reward coding batches keep gradient signal. Cap resampling
+# rounds to bound step time (DAPO recommends ~10).
+enable_filter_groups=${ENABLE_FILTER_GROUPS:-True}
 filter_groups_metric=acc
-max_num_gen_batches=${MAX_NUM_GEN_BATCHES:-0}
+max_num_gen_batches=${MAX_NUM_GEN_BATCHES:-10}
 train_prompt_bsz=${TRAIN_PROMPT_BSZ:-256}
 n_resp_per_prompt=${N_RESP_PER_PROMPT:-8}
 train_prompt_mini_bsz=${TRAIN_PROMPT_MINI_BSZ:-256}
@@ -82,7 +90,7 @@ WORKING_DIR=${WORKING_DIR:-"/inspire/hdd/project/qianghuaxuexi/hujiarui-25046/ve
 RECIPE_DIR=${RECIPE_DIR:-"${WORKING_DIR}"}
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/inspire/hdd/project/qianghuaxuexi/public"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B-Base"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B"}
 CKPTS_DIR=${CKPTS_DIR:-"/inspire/hdd3/project/qianghuaxuexi/hujiarui-25046/ckpts/${project_name}/${exp_name}"}
 export VERL_REWARD_DEBUG_DIR=${VERL_REWARD_DEBUG_DIR:-"${CKPTS_DIR}/reward_debug"}
 export VERL_REWARD_DEBUG_STEPS=${VERL_REWARD_DEBUG_STEPS:-0}
@@ -128,7 +136,8 @@ if (( infer_ppo_max_token_len < single_sequence_max_token_len )); then
     echo "ERROR: LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${infer_ppo_max_token_len} is smaller than one maximum training sequence (${single_sequence_max_token_len})." >&2
     exit 1
 fi
-actor_lr=${ACTOR_LR:-3e-6}
+# 1e-6 aligns with DeepCoder/Seed-Coder/R3-line coding recipes (was 3e-6).
+actor_lr=${ACTOR_LR:-1e-6}
 offload=${OFFLOAD:-true}
 
 # Engine-only replacement for the original FSDP settings.
@@ -146,9 +155,9 @@ rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-64}
 rollout_enforce_eager=${ROLLOUT_ENFORCE_EAGER:-True}
 rollout_compilation_mode=${ROLLOUT_COMPILATION_MODE:-NONE}
 rollout_cudagraph_mode=${ROLLOUT_CUDAGRAPH_MODE:-NONE}
-val_before_train=${VAL_BEFORE_TRAIN:-False}
+val_before_train=${VAL_BEFORE_TRAIN:-True}
 test_freq=${TEST_FREQ:-10}
-save_freq=${SAVE_FREQ:-50}
+save_freq=${SAVE_FREQ:-30}
 total_training_steps=${TOTAL_TRAINING_STEPS:-500}
 
 total_gpus=$((NNODES * NGPUS_PER_NODE))
@@ -215,6 +224,7 @@ TRAINING_CMD=(
     data.prompt_key=prompt
     data.truncation=right
     data.return_raw_chat=True
+    +data.apply_chat_template_kwargs.enable_thinking=false
     data.filter_overlong_prompts=True
     data.max_prompt_length=${max_prompt_length}
     data.max_response_length=${max_response_length}

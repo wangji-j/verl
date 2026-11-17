@@ -14,7 +14,7 @@ export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
-export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
+export WANDB_API_KEY=${WANDB_API_KEY:-}
 export WANDB_MODE=${WANDB_MODE:-online}
 export NVTE_FP8_BLOCK_SCALING_FP32_SCALES=${NVTE_FP8_BLOCK_SCALING_FP32_SCALES:-1}
 
@@ -83,7 +83,13 @@ RECIPE_DIR=${RECIPE_DIR:-"${WORKING_DIR}"}
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/inspire/hdd/project/qianghuaxuexi/public"}
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B"}
-CKPTS_DIR=${CKPTS_DIR:-"/inspire/hdd3/project/qianghuaxuexi/hujiarui-25046/ckpts/${project_name}/${exp_name}"}
+# hdd3 输出根:所有实验产物(ckpt/tensorboard/wandb)默认落 hdd3,避免写满 hdd
+OUTPUT_ROOT_HDD3=${OUTPUT_ROOT_HDD3:-"/inspire/hdd3/project/qianghuaxuexi/hujiarui-25046"}
+CKPTS_DIR=${CKPTS_DIR:-"${OUTPUT_ROOT_HDD3}/ckpts/${project_name}/${exp_name}"}
+# TensorBoard / wandb 本地缓存同样落 hdd3
+export TENSORBOARD_DIR=${TENSORBOARD_DIR:-"${OUTPUT_ROOT_HDD3}/tensorboard_log/${project_name}/${exp_name}"}
+export WANDB_DIR=${WANDB_DIR:-"${OUTPUT_ROOT_HDD3}/wandb/${project_name}/${exp_name}"}
+mkdir -p "${TENSORBOARD_DIR}" "${WANDB_DIR}"
 export VERL_REWARD_DEBUG_DIR=${VERL_REWARD_DEBUG_DIR:-"${CKPTS_DIR}/reward_debug"}
 export VERL_REWARD_DEBUG_STEPS=${VERL_REWARD_DEBUG_STEPS:-40}
 export VERL_REWARD_DEBUG_SAMPLES=${VERL_REWARD_DEBUG_SAMPLES:-16}
@@ -163,8 +169,13 @@ export TORCH_NCCL_AVOID_RECORD_STREAMS=${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}
 cd "${WORKING_DIR}"
 mkdir -p "${CKPTS_DIR}" "${CKPTS_DIR}/run_logs"
 
+# ENTRY_POINT lets an ablation wrapper swap in a trainer subclass without forking
+# this recipe (the two arms must stay identical except for the one thing under
+# test). Defaults to dapo.main_dapo, so every existing caller is unaffected.
+entry_point=${ENTRY_POINT:-dapo.main_dapo}
+
 TRAINING_CMD=(
-    python3 -m dapo.main_dapo
+    python3 -m "${entry_point}"
     --config-name=dapo_megatron_trainer
     data.train_files="${TRAIN_FILE}"
     data.val_files="${TEST_FILE}"
@@ -425,10 +436,19 @@ main() {
 
     if [ "${NODE_RANK}" = "0" ]; then
         echo "INFO: Rank 0 launching GRPO Megatron FP8 rollout baseline training with Ray address ${RAY_ADDRESS}"
-        "${TRAINING_CMD[@]}" "$@"
-        echo "INFO: Rank 0 training finished."
-        sleep 30
+        # Under `set -e` a failed training command used to exit here before `ray stop`,
+        # leaving the Ray head alive: worker nodes kept passing health-check forever and
+        # the job held every GPU without training. Always stop Ray, then report the status.
+        local train_status=0
+        "${TRAINING_CMD[@]}" "$@" || train_status=$?
+        if [ "${train_status}" -eq 0 ]; then
+            echo "INFO: Rank 0 training finished."
+            sleep 30
+        else
+            echo "ERROR: Rank 0 training exited with status ${train_status}; stopping Ray so all nodes exit." >&2
+        fi
         ray stop --force >/dev/null 2>&1 || true
+        return "${train_status}"
     elif [ "${NNODES}" -gt 1 ]; then
         local head_node_address="${RAY_MASTER_ADDR}:${RAY_MASTER_PORT}"
         echo "INFO: Worker rank ${NODE_RANK} joined Ray. Monitoring head ${head_node_address}."

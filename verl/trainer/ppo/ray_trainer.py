@@ -72,6 +72,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.router_mismatch_metrics import (
     compute_length_conditional_percentiles,
     compute_router_mismatch_metrics,
+    moe_layer_indices_from_hf_config,
 )
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -1496,6 +1497,29 @@ class RayPPOTrainer:
         value = OmegaConf.select(self.config, "router.expert_usage_num_experts", default=None)
         return None if value is None else int(value)
 
+    def _router_rollout_moe_layer_indices(self) -> list[int] | None:
+        """MoE layer indices within vLLM's per-decoder-layer routed_experts tensor.
+
+        Explicit ``router.rollout_moe_layer_indices`` wins; otherwise derive from the
+        model's HF config (None means every layer is MoE, e.g. Qwen3-MoE). Cached.
+        """
+        if hasattr(self, "_cached_rollout_moe_layer_indices"):
+            return self._cached_rollout_moe_layer_indices
+        explicit = OmegaConf.select(self.config, "router.rollout_moe_layer_indices", default=None)
+        if explicit is not None:
+            indices = [int(i) for i in explicit]
+        else:
+            from transformers import AutoConfig
+
+            model_path = OmegaConf.select(self.config, "actor_rollout_ref.model.path")
+            trust_remote_code = bool(
+                OmegaConf.select(self.config, "actor_rollout_ref.model.trust_remote_code", default=False)
+            )
+            hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+            indices = moe_layer_indices_from_hf_config(getattr(hf_config, "text_config", hf_config))
+        self._cached_rollout_moe_layer_indices = indices
+        return indices
+
     def _router_mismatch_alignment_warmup_steps(self) -> int:
         return int(OmegaConf.select(self.config, "router.mismatch_alignment_warmup_steps", default=3))
 
@@ -1503,7 +1527,24 @@ class RayPPOTrainer:
         result = self._compute_router_mismatch_result(batch, old_log_prob)
         return result.metrics if result is not None else {}
 
-    def _compute_router_mismatch_result(self, batch: DataProto, old_log_prob: DataProto):
+    def _stratified_route_sample(self, response_mask: torch.Tensor, count: int, seed: int) -> list[int]:
+        """Pick ``count`` rows spread evenly over response-length quantile strata.
+
+        A plain prefix slice is biased: balance_batch reorders the batch so the
+        first rows are short responses.
+        """
+        lengths = response_mask.sum(dim=-1).float().cpu()
+        valid_rows = torch.nonzero(lengths > 0, as_tuple=False).flatten()
+        if count <= 0 or valid_rows.numel() == 0:
+            return []
+        count = min(count, int(valid_rows.numel()))
+        order = valid_rows[torch.argsort(lengths[valid_rows], stable=True)]
+        generator = torch.Generator().manual_seed(seed)
+        strata = torch.tensor_split(order, count)
+        picks = [int(s[torch.randint(len(s), (1,), generator=generator)].item()) for s in strata if len(s)]
+        return sorted(picks)
+
+    def _compute_router_mismatch_result(self, batch: DataProto, old_log_prob: DataProto, *, capture_for_dump: bool = False):
         if not self.router_mismatch_metrics_enabled:
             return None
         if "routed_experts" not in batch.batch:
@@ -1523,9 +1564,19 @@ class RayPPOTrainer:
             else (0, -1, 1)
         )
         dump_mode = os.getenv("VERL_ROUTER_ANALYSIS_DUMP_MODE", "summary").strip().lower()
-        should_capture_counts = False
-        if dump_mode == "expert_counts" and hasattr(self, "_should_dump_router_analysis"):
-            should_capture_counts = bool(self._should_dump_router_analysis(int(getattr(self, "global_steps", -1))))
+        global_step = int(getattr(self, "global_steps", -1))
+        is_dump_step = hasattr(self, "_should_dump_router_analysis") and bool(
+            self._should_dump_router_analysis(global_step)
+        )
+        should_capture_counts = is_dump_step and dump_mode == "expert_counts"
+        # tokens/sample/full dumps also want gross changes, expert counts and a
+        # length-stratified route sample; only on the call whose result is dumped.
+        capture_extras = capture_for_dump and is_dump_step and dump_mode in {"tokens", "sample", "full"}
+        should_capture_counts = should_capture_counts or capture_extras
+        route_indices = None
+        if capture_extras:
+            route_samples = int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_ROUTE_SAMPLES", "64") or 0)
+            route_indices = self._stratified_route_sample(response_mask, route_samples, seed=global_step)
         result = compute_router_mismatch_metrics(
             rollout_routes,
             train_routes,
@@ -1536,6 +1587,9 @@ class RayPPOTrainer:
             expert_usage_smoothing_tau=self._router_expert_usage_smoothing_tau(),
             expert_usage_num_experts=self._router_expert_usage_num_experts(),
             capture_expert_usage_counts=should_capture_counts,
+            rollout_moe_layer_indices=self._router_rollout_moe_layer_indices(),
+            capture_gross=capture_extras,
+            capture_route_indices=route_indices or None,
         )
         debug_after = self._cuda_memory_snapshot(debug_device)
         self._write_perf_debug(
@@ -1589,6 +1643,288 @@ class RayPPOTrainer:
             self._router_mismatch_frozen_alignment = max(averages, key=lambda alignment: averages[alignment])
             metrics["router/rollout_vs_train/frozen_alignment"] = float(self._router_mismatch_frozen_alignment)
             metrics["router/rollout_vs_train/alignment_frozen"] = 1.0
+
+    def _router_analysis_dump_dir(self) -> str:
+        return os.getenv("VERL_ROUTER_ANALYSIS_DUMP_DIR", "").strip()
+
+    def _router_analysis_dump_mode(self) -> str:
+        return os.getenv("VERL_ROUTER_ANALYSIS_DUMP_MODE", "summary").strip().lower()
+
+    def _router_analysis_dump_float_dtype(self) -> torch.dtype:
+        dtype = os.getenv("VERL_ROUTER_ANALYSIS_DUMP_FLOAT_DTYPE", "float16").strip().lower()
+        if dtype in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        if dtype in {"fp32", "float32"}:
+            return torch.float32
+        return torch.float16
+
+    def _router_analysis_dump_topk_tokens(self) -> int:
+        return max(int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_TOPK_TOKENS", "32") or 32), 0)
+
+    def _should_dump_router_analysis(self, global_step: int) -> bool:
+        if self._router_analysis_dump_mode() in {"", "0", "false", "off", "none", "disable", "disabled"}:
+            return False
+        if not self._router_analysis_dump_dir():
+            return False
+        max_steps = int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_STEPS", "0") or 0)
+        if max_steps > 0 and global_step >= max_steps:
+            return False
+        every_n = max(int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_EVERY_N", "1") or 1), 1)
+        return global_step % every_n == 0
+
+    @staticmethod
+    def _tensor_to_cpu(tensor: torch.Tensor | None, *, dtype: torch.dtype | None = None) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        tensor = tensor.detach()
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        return tensor.cpu()
+
+    def _maybe_dump_router_analysis(self, batch: DataProto, old_log_prob: DataProto, router_result) -> None:
+        global_step = int(getattr(self, "global_steps", -1))
+        if router_result is None or not self._should_dump_router_analysis(global_step):
+            return
+
+        mode = self._router_analysis_dump_mode()
+        if mode not in {"summary", "tokens", "sample", "full", "expert_counts"}:
+            raise ValueError(
+                "VERL_ROUTER_ANALYSIS_DUMP_MODE must be one of summary, tokens, sample, full, expert_counts; "
+                f"got {mode!r}"
+            )
+
+        dump_dir = self._router_analysis_dump_dir()
+        os.makedirs(dump_dir, exist_ok=True)
+        float_dtype = self._router_analysis_dump_float_dtype()
+        responses = batch.batch.get("responses")
+        attention_mask = batch.batch.get("attention_mask")
+        if responses is not None and attention_mask is not None:
+            response_mask = attention_mask[:, -responses.shape[-1] :].bool()
+        else:
+            response_mask = batch.batch["response_mask"].bool()
+        rs_reject_mask = batch.batch.get("router_mismatch_reject_mask")
+        old_log_probs = old_log_prob.batch.get("old_log_probs")
+        rollout_log_probs = batch.batch.get("rollout_log_probs")
+
+        seq_valid_token_count = router_result.seq_valid_token_count
+        seq_mismatch = router_result.seq_mismatch
+        token_mismatch = router_result.token_mismatch
+
+        with torch.no_grad():
+            seq_prob_diff = None
+            seq_logprob_diff = None
+            prob_diff = None
+            logprob_diff = None
+            if old_log_probs is not None and rollout_log_probs is not None:
+                mask = response_mask.to(device=old_log_probs.device)
+                rollout_log_probs = rollout_log_probs.to(device=old_log_probs.device)
+                valid_count = mask.float().sum(dim=-1).clamp_min(1.0)
+                prob_diff = (old_log_probs.float().exp() - rollout_log_probs.float().exp()).abs()
+                logprob_diff = (old_log_probs.float() - rollout_log_probs.float()).abs()
+                seq_prob_diff = (prob_diff * mask.float()).sum(dim=-1) / valid_count
+                seq_logprob_diff = (logprob_diff * mask.float()).sum(dim=-1) / valid_count
+
+            token_level_scores = batch.batch.get("token_level_scores")
+            seq_reward = token_level_scores.sum(dim=-1) if token_level_scores is not None else None
+            extreme_tokens = None
+            topk_tokens = self._router_analysis_dump_topk_tokens()
+            if topk_tokens > 0 and token_mismatch is not None:
+                mismatch_scores = token_mismatch.float()
+                valid_mask = response_mask.to(device=mismatch_scores.device)
+                scored = mismatch_scores.masked_fill(~valid_mask, float("-inf"))
+                k = min(topk_tokens, scored.shape[-1])
+                top_values, top_indices = torch.topk(scored, k=k, dim=-1, largest=True, sorted=True)
+                top_valid = torch.isfinite(top_values)
+                extreme_tokens = {
+                    "topk": k,
+                    "indices": self._tensor_to_cpu(top_indices, dtype=torch.int32),
+                    "valid": self._tensor_to_cpu(top_valid),
+                    "token_mismatch": self._tensor_to_cpu(top_values.masked_fill(~top_valid, 0.0), dtype=float_dtype),
+                }
+                if responses is not None:
+                    response_ids = responses.to(device=top_indices.device)
+                    extreme_tokens["token_ids"] = self._tensor_to_cpu(
+                        torch.gather(response_ids, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=torch.int32,
+                    )
+                if old_log_probs is not None:
+                    old_on_topk = old_log_probs.to(device=top_indices.device)
+                    extreme_tokens["old_log_probs"] = self._tensor_to_cpu(
+                        torch.gather(old_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if rollout_log_probs is not None:
+                    rollout_on_topk = rollout_log_probs.to(device=top_indices.device)
+                    extreme_tokens["rollout_log_probs"] = self._tensor_to_cpu(
+                        torch.gather(rollout_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if prob_diff is not None:
+                    prob_diff_on_topk = prob_diff.to(device=top_indices.device)
+                    extreme_tokens["prob_diff"] = self._tensor_to_cpu(
+                        torch.gather(prob_diff_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if logprob_diff is not None:
+                    logprob_diff_on_topk = logprob_diff.to(device=top_indices.device)
+                    extreme_tokens["logprob_diff"] = self._tensor_to_cpu(
+                        torch.gather(logprob_diff_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+            extreme_prob_diff_tokens = None
+            if topk_tokens > 0 and prob_diff is not None:
+                valid_mask = response_mask.to(device=prob_diff.device)
+                scored = prob_diff.float().masked_fill(~valid_mask, float("-inf"))
+                k = min(topk_tokens, scored.shape[-1])
+                top_values, top_indices = torch.topk(scored, k=k, dim=-1, largest=True, sorted=True)
+                top_valid = torch.isfinite(top_values)
+                extreme_prob_diff_tokens = {
+                    "topk": k,
+                    "indices": self._tensor_to_cpu(top_indices, dtype=torch.int32),
+                    "valid": self._tensor_to_cpu(top_valid),
+                    "prob_diff": self._tensor_to_cpu(top_values.masked_fill(~top_valid, 0.0), dtype=float_dtype),
+                }
+                if responses is not None:
+                    response_ids = responses.to(device=top_indices.device)
+                    extreme_prob_diff_tokens["token_ids"] = self._tensor_to_cpu(
+                        torch.gather(response_ids, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=torch.int32,
+                    )
+                if token_mismatch is not None:
+                    mismatch_on_topk = token_mismatch.to(device=top_indices.device)
+                    extreme_prob_diff_tokens["token_mismatch"] = self._tensor_to_cpu(
+                        torch.gather(mismatch_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if old_log_probs is not None:
+                    old_on_topk = old_log_probs.to(device=top_indices.device)
+                    extreme_prob_diff_tokens["old_log_probs"] = self._tensor_to_cpu(
+                        torch.gather(old_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if rollout_log_probs is not None:
+                    rollout_on_topk = rollout_log_probs.to(device=top_indices.device)
+                    extreme_prob_diff_tokens["rollout_log_probs"] = self._tensor_to_cpu(
+                        torch.gather(rollout_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+                if logprob_diff is not None:
+                    logprob_diff_on_topk = logprob_diff.to(device=top_indices.device)
+                    extreme_prob_diff_tokens["logprob_diff"] = self._tensor_to_cpu(
+                        torch.gather(logprob_diff_on_topk, dim=-1, index=top_indices.clamp_min(0)),
+                        dtype=float_dtype,
+                    )
+
+            payload = {
+                "metadata": {
+                    "global_step": global_step,
+                    "mode": mode,
+                    "alignment": int(router_result.alignment),
+                    "alignment_scores": router_result.alignment_scores,
+                    "batch_size": int(batch.batch.batch_size[0]) if batch.batch is not None else 0,
+                    "response_mask_shape": list(response_mask.shape),
+                    "response_mask_tokens": int(response_mask.sum().item()),
+                    "float_dtype": str(float_dtype),
+                    "extreme_token_topk": topk_tokens,
+                    "rollout_routes_shape": list(batch.batch["routed_experts"].shape)
+                    if "routed_experts" in batch.batch
+                    else None,
+                    "train_routes_shape": list(old_log_prob.batch["routed_experts"].shape)
+                    if "routed_experts" in old_log_prob.batch
+                    else None,
+                    "rollout_routes_dtype": str(batch.batch["routed_experts"].dtype)
+                    if "routed_experts" in batch.batch
+                    else None,
+                    "train_routes_dtype": str(old_log_prob.batch["routed_experts"].dtype)
+                    if "routed_experts" in old_log_prob.batch
+                    else None,
+                    "metric_names": sorted(router_result.metrics.keys()),
+                },
+                "metrics": dict(router_result.metrics),
+                "response_summary": {
+                    "seq_mismatch": self._tensor_to_cpu(seq_mismatch, dtype=torch.float32),
+                    "seq_valid_token_count": self._tensor_to_cpu(seq_valid_token_count, dtype=torch.float32),
+                    "seq_prob_diff": self._tensor_to_cpu(seq_prob_diff, dtype=torch.float32),
+                    "seq_logprob_diff": self._tensor_to_cpu(seq_logprob_diff, dtype=torch.float32),
+                    "seq_reward": self._tensor_to_cpu(seq_reward, dtype=torch.float32),
+                    "rs_reject_mask": self._tensor_to_cpu(rs_reject_mask),
+                    "extreme_tokens": extreme_tokens,
+                    "extreme_prob_diff_tokens": extreme_prob_diff_tokens,
+                    "expert_usage_distances": {
+                        name: self._tensor_to_cpu(values, dtype=torch.float32)
+                        for name, values in (router_result.expert_usage_distances or {}).items()
+                    },
+                },
+            }
+
+            uids = batch.non_tensor_batch.get("uid") if hasattr(batch, "non_tensor_batch") else None
+            if uids is not None:
+                payload["uids"] = [str(uid) for uid in uids]
+
+            if mode in {"tokens", "sample", "full"}:
+                payload["token_data"] = {
+                    "responses": self._tensor_to_cpu(responses, dtype=torch.int32),
+                    "response_mask": self._tensor_to_cpu(response_mask),
+                    "attention_mask": self._tensor_to_cpu(attention_mask),
+                    "token_mismatch": self._tensor_to_cpu(token_mismatch, dtype=float_dtype),
+                    "old_log_probs": self._tensor_to_cpu(old_log_probs, dtype=float_dtype),
+                    "rollout_log_probs": self._tensor_to_cpu(rollout_log_probs, dtype=float_dtype),
+                    "logprob_delta": self._tensor_to_cpu(
+                        old_log_probs.float() - rollout_log_probs.float()
+                        if old_log_probs is not None and rollout_log_probs is not None
+                        else None,
+                        dtype=float_dtype,
+                    ),
+                    "logprob_diff": self._tensor_to_cpu(logprob_diff, dtype=float_dtype),
+                    "prob_diff": self._tensor_to_cpu(prob_diff, dtype=float_dtype),
+                }
+
+            if mode in {"sample", "full"}:
+                route_limit = int(os.getenv("VERL_ROUTER_ANALYSIS_DUMP_SAMPLES", "16") or 16)
+                route_count = int(response_mask.shape[0]) if mode == "full" else min(route_limit, int(response_mask.shape[0]))
+                route_slice = slice(0, route_count)
+                payload["routed_experts"] = {
+                    "sample_count": route_count,
+                    "rollout": self._tensor_to_cpu(batch.batch["routed_experts"][route_slice])
+                    if "routed_experts" in batch.batch
+                    else None,
+                    "train": self._tensor_to_cpu(old_log_prob.batch["routed_experts"][route_slice])
+                    if "routed_experts" in old_log_prob.batch
+                    else None,
+                }
+
+            if router_result.gross is not None:
+                payload["gross"] = {
+                    "seq_flip_rate": self._tensor_to_cpu(router_result.gross["seq_flip_rate"], dtype=torch.float32),
+                    "seq_overlap_mismatch": self._tensor_to_cpu(
+                        router_result.gross["seq_overlap_mismatch"], dtype=torch.float32
+                    ),
+                    "seq_layer_changed_slots": self._tensor_to_cpu(router_result.gross["seq_layer_changed_slots"]),
+                    "token_flip_rate": self._tensor_to_cpu(router_result.gross["token_flip_rate"], dtype=float_dtype),
+                }
+            if router_result.sampled_routes is not None:
+                payload["sampled_routes"] = {
+                    **router_result.sampled_routes,
+                    "rollout_moe_layer_indices": self._router_rollout_moe_layer_indices(),
+                    "note": "response positions only; train side shifted by metadata.alignment; top-k sorted",
+                }
+
+            if mode == "expert_counts" and router_result.expert_usage_counts is None:
+                raise RuntimeError("expert_counts dump mode requires per-response expert counts, but none were captured")
+            if router_result.expert_usage_counts is not None:
+                payload["expert_usage"] = {
+                    "distances_by_layer": {
+                        name: self._tensor_to_cpu(values, dtype=float_dtype)
+                        for name, values in (router_result.expert_usage_distances_by_layer or {}).items()
+                    },
+                    "counts": {
+                        side: self._tensor_to_cpu(values)
+                        for side, values in router_result.expert_usage_counts.items()
+                    },
+                }
+
+        path = os.path.join(dump_dir, f"router_analysis_step{global_step:04d}_pid{os.getpid()}.pt")
+        torch.save(payload, path)
 
     def _apply_router_mismatch_rs(self, batch: DataProto, router_result) -> dict[str, float]:
         if (

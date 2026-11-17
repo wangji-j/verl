@@ -24,6 +24,8 @@ class RouterMismatchResult:
     expert_usage_distances: dict[str, torch.Tensor] | None = None
     expert_usage_distances_by_layer: dict[str, torch.Tensor] | None = None
     expert_usage_counts: dict[str, torch.Tensor] | None = None
+    gross: dict[str, torch.Tensor] | None = None
+    sampled_routes: dict[str, torch.Tensor] | None = None
 
 
 def compute_length_conditional_percentiles(
@@ -109,6 +111,9 @@ def compute_router_mismatch_metrics(
     expert_usage_smoothing_tau: float = 4096.0,
     expert_usage_num_experts: int | None = None,
     capture_expert_usage_counts: bool = False,
+    rollout_moe_layer_indices: Iterable[int] | None = None,
+    capture_gross: bool = False,
+    capture_route_indices: Iterable[int] | None = None,
 ) -> RouterMismatchResult:
     """Compare rollout and training router choices on response-token positions.
 
@@ -116,6 +121,14 @@ def compute_router_mismatch_metrics(
     ``0`` compares identical sequence positions, ``-1`` compares the route
     from the previous training input position, and ``1`` compares the next
     position. The best alignment is selected by response-token top-k match rate.
+
+    vLLM records routes for every decoder layer (dense layers stay all-zero),
+    while Megatron records only MoE layers. ``rollout_moe_layer_indices`` selects
+    the MoE layers out of the rollout tensor so both sides index the same layers.
+
+    Dump-only extras (computed on the same aligned response routes as the score):
+    ``capture_gross`` adds slot-level change counts (see ``_gross_route_changes``);
+    ``capture_route_indices`` returns those rows' aligned response routes.
     """
 
     compute_device = _select_compute_device(rollout_routed_experts, train_routed_experts)
@@ -128,6 +141,8 @@ def compute_router_mismatch_metrics(
             "routed_experts must have shape [batch, seq_len, num_layers, topk], "
             f"got rollout={tuple(rollout.shape)} train={tuple(train.shape)}"
         )
+
+    rollout = select_moe_layers(rollout, train.shape[2], rollout_moe_layer_indices)
 
     if rollout.shape[0] != train.shape[0]:
         raise ValueError(f"Batch size mismatch: rollout={rollout.shape[0]} train={train.shape[0]}")
@@ -207,6 +222,22 @@ def compute_router_mismatch_metrics(
         expert_usage_distances = None
         expert_usage_distances_by_layer = None
         expert_usage_counts = None
+
+    gross = _gross_route_changes(rollout_resp, train_resp, valid_mask) if capture_gross else None
+    sampled_routes = None
+    if capture_route_indices is not None:
+        indices = torch.as_tensor(list(capture_route_indices), dtype=torch.int64, device=rollout_resp.device)
+        max_expert = max(int(rollout_resp.max().item()), int(train_resp.max().item())) if rollout_resp.numel() else 0
+        route_dtype = torch.uint8 if max_expert <= 255 else torch.int16
+        sampled_routes = {
+            "indices": indices.cpu(),
+            # Response positions only, rollout side and train side after the selected
+            # alignment; top-k sorted ascending (sets, not gate-ranked).
+            "rollout": rollout_resp.index_select(0, indices).to(dtype=route_dtype).cpu(),
+            "train": train_resp.index_select(0, indices).to(dtype=route_dtype).cpu(),
+            "valid_mask": valid_mask.index_select(0, indices).cpu(),
+        }
+
     return RouterMismatchResult(
         metrics=metrics,
         alignment=best_alignment,
@@ -217,7 +248,98 @@ def compute_router_mismatch_metrics(
         expert_usage_distances=expert_usage_distances,
         expert_usage_distances_by_layer=expert_usage_distances_by_layer,
         expert_usage_counts=expert_usage_counts,
+        gross=gross,
+        sampled_routes=sampled_routes,
     )
+
+
+def _gross_route_changes(
+    rollout: torch.Tensor, train: torch.Tensor, valid_mask: torch.Tensor, *, chunk_elems: int = 1 << 27
+) -> dict[str, torch.Tensor]:
+    """Slot-level (gross) route changes between aligned rollout and train response routes.
+
+    Inputs are canonicalized [B, T, L, K] top-k sets plus a [B, T] valid mask. Returns
+    per sequence: ``seq_flip_rate`` (share of valid token-layers whose top-k set changed),
+    ``seq_overlap_mismatch`` (mean 1 - |overlap|/K), ``seq_layer_changed_slots`` [B, L]
+    (number of top-k slots that changed, summed over valid tokens), and per token
+    ``token_flip_rate`` [B, T] (share of layers whose set changed). Unlike the expert-usage
+    L1 (net), changes that cancel inside a response's histogram still count here.
+    Chunked over the batch because the pairwise slot comparison is [B, T, L, K, K].
+    """
+    batch_size, seq_len, layer_count, topk = rollout.shape
+    rows_per_chunk = max(1, chunk_elems // max(seq_len * layer_count * topk * topk, 1))
+    valid = valid_mask.to(dtype=torch.bool)
+    token_count = valid.sum(dim=-1).float()
+    seq_flip = torch.zeros(batch_size, dtype=torch.float32, device=rollout.device)
+    seq_overlap = torch.zeros_like(seq_flip)
+    layer_changed = torch.zeros((batch_size, layer_count), dtype=torch.int32, device=rollout.device)
+    token_flip = torch.zeros((batch_size, seq_len), dtype=torch.float32, device=rollout.device)
+    for start in range(0, batch_size, rows_per_chunk):
+        end = min(start + rows_per_chunk, batch_size)
+        overlap = (rollout[start:end].unsqueeze(-1) == train[start:end].unsqueeze(-2)).any(dim=-1).sum(dim=-1)
+        v = valid[start:end]
+        changed = (topk - overlap) * v.unsqueeze(-1)
+        flipped = (changed > 0).float()
+        layer_changed[start:end] = changed.sum(dim=1).to(dtype=torch.int32)
+        token_flip[start:end] = flipped.mean(dim=-1) * v.float()
+        seq_flip[start:end] = flipped.sum(dim=(1, 2))
+        seq_overlap[start:end] = changed.sum(dim=(1, 2)).float() / topk
+    denom = (token_count * layer_count).clamp_min(1.0)
+    return {
+        "seq_flip_rate": seq_flip / denom,
+        "seq_overlap_mismatch": seq_overlap / denom,
+        "seq_layer_changed_slots": layer_changed,
+        "token_flip_rate": token_flip,
+    }
+
+
+def moe_layer_indices_from_hf_config(hf_config) -> list[int] | None:
+    """Return decoder-layer indices that are MoE layers, or None if every layer is MoE.
+
+    Covers DeepSeek-V3 style configs (``first_k_dense_replace`` + ``moe_layer_freq``)
+    and Qwen-MoE style configs (``mlp_only_layers`` + ``decoder_sparse_step``).
+    """
+    num_layers = getattr(hf_config, "num_hidden_layers", None)
+    if num_layers is None:
+        return None
+    first_k_dense = int(getattr(hf_config, "first_k_dense_replace", 0) or 0)
+    moe_freq = int(getattr(hf_config, "moe_layer_freq", 1) or 1)
+    mlp_only = set(getattr(hf_config, "mlp_only_layers", None) or [])
+    sparse_step = int(getattr(hf_config, "decoder_sparse_step", 1) or 1)
+    indices = [
+        i
+        for i in range(num_layers)
+        if i >= first_k_dense
+        and i % moe_freq == 0
+        and i not in mlp_only
+        and (i + 1) % sparse_step == 0
+    ]
+    return None if len(indices) == num_layers else indices
+
+
+def select_moe_layers(
+    rollout: torch.Tensor, train_num_layers: int, moe_layer_indices: Iterable[int] | None
+) -> torch.Tensor:
+    """Drop dense-layer slots from rollout routes so they line up with training routes.
+
+    Fails closed: if the layer counts still differ afterwards, raise instead of
+    silently comparing shifted layers (which makes every token look mismatched).
+    """
+    if moe_layer_indices is not None:
+        indices = list(moe_layer_indices)
+        if rollout.shape[2] != len(indices):
+            if max(indices) >= rollout.shape[2]:
+                raise ValueError(
+                    f"rollout_moe_layer_indices reach layer {max(indices)} but rollout routes "
+                    f"have only {rollout.shape[2]} layers"
+                )
+            rollout = rollout.index_select(2, torch.as_tensor(indices, device=rollout.device))
+    if rollout.shape[2] != train_num_layers:
+        raise ValueError(
+            f"Rollout routes have {rollout.shape[2]} layers but training routes have "
+            f"{train_num_layers}; pass rollout_moe_layer_indices for models with dense layers"
+        )
+    return rollout
 
 
 def _normalize_routes(routes: torch.Tensor, *, device: torch.device) -> torch.Tensor:

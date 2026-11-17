@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
-export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
+export WANDB_API_KEY=${WANDB_API_KEY:-}
 
 project_name='DAPO-FP8-ROLLOUT'
 exp_name='DAPO-Qwen3-MOE-30B-VLLM-FP8-ROLLOUT'

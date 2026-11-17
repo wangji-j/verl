@@ -1,33 +1,8 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-# =============================================================================
-# Fully-async (disaggregated) RDC + TIS recipe for Qwen3-30B-A3B MoE.
-#
-# Async counterpart of the synchronous static-RS recipe
-#   run_grpo_qwen3_30b_a3b_expert_distribution_l1_lengthbucket_top8RS_TIS.sh
-#
-# Design note: the async/disaggregated setting is off-policy *by construction*
-# (rollout runs continuously on stale param version V_gen; the trainer updates
-# at the current params). So we DO NOT use current-aware / OFF_POLICY_MINI_STEPS.
-# We only use STATIC sequence-level RDC: per training step, compare rollout
-# routes (carried on the sample, generated at V_gen) against the train-side
-# old_log_prob forward, and mask over-drifted responses before advantage/update.
-# The RS itself is applied inside SeparateRayPPOTrainer._fit_compute_log_prob
-# (inherited RDC helpers), gated by router.enable_mismatch_rs.
-#
-# Cluster: one flat Ray cluster spanning all nodes; the fully-async framework
-# carves separate resource pools for the rollouter (rollout.nnodes) and the
-# trainer (trainer.nnodes). Bootstrap logic is reused from the sync recipe.
-#
-# TUNE FOR YOUR ALLOCATION: NNODES_ROLLOUT / NNODES_TRAIN (must sum to the nodes
-# you launched) and the Megatron/rollout parallelism below.
-# =============================================================================
-
 ulimit -c 0 || true
 
-# math-verify is required by the MATH-500 validation scorer on every node;
-# verl's wrapper silently returns 0.0 if the import fails, so ensure it here.
 python3 -c "import math_verify" 2>/dev/null || pip install --quiet --no-index \
     --find-links /inspire/hdd/project/qianghuaxuexi/public/wheels math-verify || \
     echo "WARNING: math-verify install failed; MATH-500 validation scores will be 0"
@@ -37,7 +12,7 @@ export HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR:-1}
 export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
-export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
+export WANDB_API_KEY=${WANDB_API_KEY:-}
 export WANDB_MODE=${WANDB_MODE:-online}
 export NVTE_FP8_BLOCK_SCALING_FP32_SCALES=${NVTE_FP8_BLOCK_SCALING_FP32_SCALES:-1}
 
@@ -58,18 +33,14 @@ kl_loss_type=${KL_LOSS_TYPE:-low_var_kl}
 clip_ratio_low=0.2
 clip_ratio_high=0.27
 
-# --- Token-level truncated importance sampling (TIS C=2), decoupled mode ------
-# bypass_mode MUST be False: the RDC hook lives in the decoupled branch of
-# _fit_compute_log_prob, which is the only path that recomputes old_log_prob and
-# therefore produces the train-side routed_experts RDC needs.
 rollout_is=token
 rollout_is_threshold=2.0
 rollout_is_batch_normalize=false
+# RDC requires bypass_mode=False to collect train-side routes.
 bypass_mode=False
 rollout_rs=null
 rollout_rs_threshold=null
 
-# --- Router Drift Control: static sequence-level rejection sampling -----------
 enable_router_mismatch_rs=${ENABLE_ROUTER_MISMATCH_RS:-True}
 router_mismatch_rs_threshold=${ROUTER_MISMATCH_RS_THRESHOLD:-0.0}
 router_mismatch_rs_mode=${ROUTER_MISMATCH_RS_MODE:-length_bucket_top_fraction}
@@ -90,28 +61,18 @@ overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
-# --- Async batching -----------------------------------------------------------
-# In fully-async mode train_batch_size is 0 (the trainer pulls require_batches
-# ppo-mini-batches worth of samples from the queue) and gen_batch_size is 1.
 n_resp_per_prompt=${N_RESP_PER_PROMPT:-8}
 train_prompt_bsz=0
 gen_prompt_bsz=1
 train_prompt_mini_bsz=${TRAIN_PROMPT_MINI_BSZ:-32}
 
-# --- Async / staleness knobs (main things to tune) ---------------------------
 staleness_threshold=${STALENESS_THRESHOLD:-0.5}
 trigger_parameter_sync_step=${TRIGGER_PARAMETER_SYNC_STEP:-4}
 require_batches=${REQUIRE_BATCHES:-1}
 partial_rollout=${PARTIAL_ROLLOUT:-True}
 
-# Training length. The rollouter stops after `total_rollout_steps` SAMPLES; one
-# training step consumes required_samples * trigger_parameter_sync_step =
-# (ppo_mini_batch_size * require_batches) * trigger_parameter_sync_step samples
-# (see fully_async_rollouter.py:669). So specify the desired number of TRAINING
-# steps and derive the sample budget, instead of hand-guessing total_rollout_steps
-# (the old default 32*400 silently became only 100 train steps at trigger=4).
-# TOTAL_ROLLOUT_STEPS still overrides the sample budget directly if preferred.
 total_training_steps=${TOTAL_TRAINING_STEPS:-500}
+# Convert training steps to the async rollout sample budget.
 samples_per_train_step=$(( train_prompt_mini_bsz * require_batches * trigger_parameter_sync_step ))
 total_rollout_steps=${TOTAL_ROLLOUT_STEPS:-$(( total_training_steps * samples_per_train_step ))}
 
@@ -135,7 +96,6 @@ ZEBRALOGIC_FILE=${ZEBRALOGIC_FILE:-"${WORKING_DIR}/data/zebra_logic/test.parquet
 FULL_BENCHMARK_FILE=${FULL_BENCHMARK_FILE:-"${WORKING_DIR}/data/zebra_logic/math_and_zebralogic.parquet"}
 TEST_FILE=${TEST_FILE:-"${FULL_BENCHMARK_FILE}"}
 
-# --- Node split: rollout pool + train pool = all launched nodes ---------------
 NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
 NNODES_TRAIN=${NNODES_TRAIN:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
@@ -156,22 +116,15 @@ val_top_k=${VAL_TOP_K:-20}
 use_dynamic_bsz=False
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
-# Async off-policy uses a lower LR than the sync recipe (3e-6): all fully-async
-# megatron reference recipes use 1e-6 to stay stable under staleness.
 actor_lr=${ACTOR_LR:-1e-6}
-# lr_decay_style=constant keeps LR flat, but Megatron's scheduler still asserts
-# lr_decay_steps > 0, so it is set to total_rollout_steps below. warmup_init is
-# the LR at step 0 of the (short) warmup.
 actor_lr_warmup_init=${ACTOR_LR_WARMUP_INIT:-1e-7}
 offload=${OFFLOAD:-true}
 
-# Megatron parallelism for the TRAIN pool (fits one 8-GPU node by default).
 train_tp=${TRAIN_TP:-4}
 train_pp=${TRAIN_PP:-1}
 train_ep=${TRAIN_EP:-4}
 train_etp=${TRAIN_ETP:-2}
 
-# Rollout (vLLM) tensor parallel: 8 GPUs / gen_tp replicas.
 gen_tp=${GEN_TP:-2}
 rollout_gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.85}
 rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}
@@ -221,7 +174,6 @@ TRAINING_CMD=(
     algorithm.rollout_correction.rollout_is_batch_normalize=${rollout_is_batch_normalize}
     algorithm.rollout_correction.rollout_rs=${rollout_rs}
     algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold}
-    # --- RDC static rejection sampling (top-level router group) ---------------
     router.enable_mismatch_metrics=True
     router.enable_mismatch_rs=${enable_router_mismatch_rs}
     router.mismatch_rs_threshold=${router_mismatch_rs_threshold}
@@ -232,7 +184,6 @@ TRAINING_CMD=(
     router.mismatch_alignment_warmup_steps=${router_mismatch_alignment_warmup_steps}
     router.expert_usage_smoothing_tau=${router_expert_usage_smoothing_tau}
     router.expert_usage_num_experts=${router_expert_usage_num_experts}
-    # engine-facing flag so the Megatron actor forward records train-side routes
     +actor_rollout_ref.router.enable_mismatch_metrics=True
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss}
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef}

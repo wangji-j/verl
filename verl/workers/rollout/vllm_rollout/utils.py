@@ -258,6 +258,23 @@ class vLLMColocateWorkerExtension:
 
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
+        elif is_fp8_model(self.model_runner.vllm_config) and not (peft_config and base_sync_done):
+            # The FP8 path skips vLLM's process_weights_after_loading (its FP8 quant step is
+            # handled by verl's patches). But MLA attention (DeepSeek-V3 / Moonlight) caches
+            # W_UK_T / W_UV derived from kv_b_proj there; without a refresh they stay derived
+            # from the dummy init weights and rollouts are gibberish. Refresh only MLA modules.
+            from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+            from vllm.model_executor.model_loader.utils import device_loading_context
+
+            for model, model_config in self._iter_all_models_with_config():
+                refreshed = 0
+                for module in model.modules():
+                    if isinstance(module, MLAAttention):
+                        with device_loading_context(module, self.device):
+                            module.process_weights_after_loading(model_config.dtype)
+                        refreshed += 1
+                if refreshed:
+                    logger.info(f"FP8 sync: refreshed MLA absorbed weights in {refreshed} attention layers")
 
     def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
         if peft_config and base_sync_done:

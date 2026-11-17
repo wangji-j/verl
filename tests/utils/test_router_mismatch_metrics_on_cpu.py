@@ -1,8 +1,13 @@
 import torch
 
+from types import SimpleNamespace
+
+import pytest
+
 from verl.utils.router_mismatch_metrics import (
     compute_length_conditional_percentiles,
     compute_router_mismatch_metrics,
+    moe_layer_indices_from_hf_config,
 )
 
 
@@ -225,3 +230,87 @@ def test_expert_usage_probe_does_not_retain_counts_unless_requested_on_cpu():
     )
 
     assert result.expert_usage_counts is None
+
+
+def _dense_plus_moe_routes():
+    # 3 decoder layers, layer 0 dense: vLLM leaves its slot all-zero, Megatron omits it.
+    moe_routes = torch.tensor([[[[1, 2], [3, 4]], [[5, 6], [7, 8]]]])  # [1, 2 tokens, 2 MoE layers, topk 2]
+    dense_slot = torch.zeros(1, 2, 1, 2, dtype=moe_routes.dtype)
+    rollout = torch.cat([dense_slot, moe_routes], dim=2)  # [1, 2, 3, 2]
+    return rollout, moe_routes.clone()
+
+
+def test_router_mismatch_metrics_drops_dense_layer_slots_on_cpu():
+    rollout, train = _dense_plus_moe_routes()
+    response_mask = torch.tensor([[1, 1]])
+
+    result = compute_router_mismatch_metrics(
+        rollout, train, response_mask, alignments=(0,), rollout_moe_layer_indices=[1, 2]
+    )
+
+    assert result.metrics["router/response_token_match_rate"] == 1.0
+    assert result.metrics["router/layer_0/response_token_match_rate"] == 1.0
+    assert result.metrics["router/layer_1/response_token_match_rate"] == 1.0
+
+
+def test_router_mismatch_metrics_fails_closed_on_layer_count_mismatch_on_cpu():
+    rollout, train = _dense_plus_moe_routes()
+    response_mask = torch.tensor([[1, 1]])
+
+    with pytest.raises(ValueError, match="rollout_moe_layer_indices"):
+        compute_router_mismatch_metrics(rollout, train, response_mask, alignments=(0,))
+
+
+def test_moe_layer_indices_from_hf_config_on_cpu():
+    moonlight = SimpleNamespace(num_hidden_layers=27, first_k_dense_replace=1, moe_layer_freq=1)
+    assert moe_layer_indices_from_hf_config(moonlight) == list(range(1, 27))
+
+    qwen3_moe = SimpleNamespace(num_hidden_layers=48, mlp_only_layers=[], decoder_sparse_step=1)
+    assert moe_layer_indices_from_hf_config(qwen3_moe) is None
+
+
+def test_router_mismatch_metrics_gross_counts_cancelled_changes_on_cpu():
+    # 1 response, 3 tokens, 1 layer, top-2. Token 0 unchanged, token 1 swaps one expert
+    # (1 slot), token 2 is masked out. The usage histogram (net) can hide swaps; gross counts slots.
+    rollout = torch.tensor([[[[0, 1]], [[2, 3]], [[4, 5]]]])
+    train = torch.tensor([[[[0, 1]], [[2, 4]], [[6, 7]]]])
+    response_mask = torch.tensor([[1, 1, 0]])
+
+    result = compute_router_mismatch_metrics(
+        rollout, train, response_mask, alignments=(0,), metric_mode="expert_usage_l1", capture_gross=True
+    )
+
+    gross = result.gross
+    torch.testing.assert_close(gross["seq_flip_rate"], torch.tensor([0.5]))
+    torch.testing.assert_close(gross["seq_overlap_mismatch"], torch.tensor([0.25]))
+    assert gross["seq_layer_changed_slots"].tolist() == [[1]]
+    torch.testing.assert_close(gross["token_flip_rate"], torch.tensor([[0.0, 1.0, 0.0]]))
+
+
+def test_router_mismatch_metrics_samples_aligned_response_routes_on_cpu():
+    # prompt token at position 0, response tokens at 1..2; train side recorded one position later.
+    rollout = torch.tensor([[[[9, 9]], [[1, 2]], [[3, 4]]], [[[9, 9]], [[5, 6]], [[7, 8]]]])
+    train = torch.tensor([[[[0, 0]], [[0, 0]], [[1, 2]], [[3, 4]]], [[[0, 0]], [[0, 0]], [[5, 6]], [[7, 8]]]])
+    response_mask = torch.tensor([[1, 1], [1, 1]])
+
+    result = compute_router_mismatch_metrics(rollout, train, response_mask, alignments=(0,), capture_route_indices=[1])
+
+    sampled = result.sampled_routes
+    assert sampled["indices"].tolist() == [1]
+    assert sampled["rollout"].dtype == torch.uint8
+    assert sampled["rollout"].tolist() == [[[[5, 6]], [[7, 8]]]]
+    assert sampled["train"].tolist() == [[[[5, 6]], [[7, 8]]]]
+    assert result.metrics["router/response_token_match_rate"] == 1.0
+
+
+def test_stratified_route_sample_spans_lengths_on_cpu():
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+    lengths = torch.arange(1, 101)  # rows sorted short to long, like after balance_batch
+    response_mask = (torch.arange(100).unsqueeze(0) < lengths.unsqueeze(1)).long()
+
+    picks = RayPPOTrainer._stratified_route_sample(None, response_mask, 4, seed=0)
+
+    assert len(picks) == 4
+    assert max(picks) >= 75  # a prefix slice would only return rows 0..3
+    assert picks == RayPPOTrainer._stratified_route_sample(None, response_mask, 4, seed=0)

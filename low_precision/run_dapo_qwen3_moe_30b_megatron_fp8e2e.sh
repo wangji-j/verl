@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://wandb1.sii.edu.cn/}
-export WANDB_API_KEY=${WANDB_API_KEY:-local-6a4cc4c8b917355ce21530f9c9be52014cc55ee2}
+export WANDB_API_KEY=${WANDB_API_KEY:-}
 
 # need cuda12.9 or higher
 # use docker://verlai/verl:dev.vllm_nightly-243ed7d32e94f00a9a32fbbc51be932f6277a55d or self build

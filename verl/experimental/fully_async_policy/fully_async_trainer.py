@@ -472,16 +472,48 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
         then restore the parameters of the current version.
+
+        RDC route source (router.rdc_current_param_routes):
+          - False (default): routed_experts come from the version-1 forward, i.e.
+            RDC compares rollout routes against the window-anchor policy. This is
+            the historical behavior.
+          - True: routed_experts come from an extra forward under the *current*
+            theta (the params already on GPU when this method is entered), so RDC
+            compares rollout routes against the live policy and therefore folds in
+            BOTH train/infer mismatch AND in-window training drift. old_log_prob
+            (the PPO anchor) is still taken from the version-1 forward and is
+            unchanged. Only meaningful for local_trigger_step >= 2; at step 1 the
+            version-1 params ARE the current params, so the two agree.
         """
+        rdc_current_param_routes = bool(
+            OmegaConf.select(self.config, "router.rdc_current_param_routes", default=False)
+        )
+
         if self.local_trigger_step == 1:
             self.actor_rollout_wg.save_model_to_cpu(1)
             old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
         else:
             self.actor_rollout_wg.save_model_to_cpu(self.local_trigger_step)
+            # Optionally probe routes under the *current* theta before rolling back
+            # to version 1. GPU currently holds the current params, so this forward
+            # yields live-policy routes for RDC without disturbing the PPO anchor.
+            current_routed_experts = None
+            if rdc_current_param_routes:
+                current_out, _ = super()._compute_old_log_prob(batch)
+                current_routed_experts = current_out.batch.pop("routed_experts", None)
+                del current_out
             self.actor_rollout_wg.restore_model_from_cpu(1)
             old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
             self.actor_rollout_wg.restore_model_from_cpu(self.local_trigger_step)
             self.actor_rollout_wg.clear_cpu_model(self.local_trigger_step)
+            # Swap in the current-theta routes for RDC; old_log_probs stay version-1.
+            if rdc_current_param_routes and current_routed_experts is not None:
+                if "routed_experts" not in old_log_prob.batch:
+                    raise RuntimeError(
+                        "router.rdc_current_param_routes=True but the version-1 forward produced no "
+                        "routed_experts to replace; ensure routing capture is enabled on the actor."
+                    )
+                old_log_prob.batch["routed_experts"] = current_routed_experts
         return old_log_prob, old_log_prob_mfu
 
     def _fit_update_local_step(self):
